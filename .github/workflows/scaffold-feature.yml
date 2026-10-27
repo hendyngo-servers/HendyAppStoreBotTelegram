@@ -32,7 +32,7 @@ jobs:
           FEATURE_NAME: ${{ inputs.feature_name }}
           TARGET: ${{ inputs.target }}
         run: node scripts/scaffold/generate-module.js "$FEATURE_NAME" "$TARGET"
-      - uses: peter-evans/create-pull-request@v7
+      - uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           branch: scaffold/${{ inputs.feature_name }}
