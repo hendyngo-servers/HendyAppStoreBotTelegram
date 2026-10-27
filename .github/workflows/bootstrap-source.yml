@@ -45,12 +45,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Validate workspace and database
+      - name: Validate source manifests, database, and feature tests
         if: steps.gate.outputs.present == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          node scripts/check-workspace.js
+          node --input-type=module -e 'import fs from "node:fs"; import path from "node:path"; const root = process.cwd(); let count = 0; const walk = d => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (["node_modules", ".git", "dist"].includes(e.name)) continue; const p = path.join(d, e.name); if (e.isDirectory()) walk(p); else if (e.name === "package.json") { JSON.parse(fs.readFileSync(p, "utf8")); count++; } } }; walk(root); for (const p of ["apps/mini-app/package.json", "apps/web-user/package.json", "apps/web-admin/package.json", "database/migrations/0008_feature_flags.sql", "workers/queue-processor/src/index.ts"]) if (!fs.existsSync(p)) throw new Error("Missing required source path: " + p); console.log("Manifest/source validation passed (" + count + " package.json files).");'
           python3 scripts/test_db.py
           node --test packages/feature-flags/test/*.test.js
       - name: Commit complete source tree
