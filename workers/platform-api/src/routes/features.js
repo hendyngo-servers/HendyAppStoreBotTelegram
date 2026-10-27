@@ -302,24 +302,18 @@ async function adminSyncGitHubSecrets(request, env) {
 
 async function adminSystemUpdate(request, env) {
   const { user } = await requireAdmin(request, env);
-  if (!env.GITHUB_TOKEN || !env.GITHUB_OWNER || !env.GITHUB_REPO) throw new HttpError(503, 'GitHub workflow dispatch is not configured', 'GITHUB_NOT_CONFIGURED');
+  if (!env.GITHUB_TOKEN || !env.GITHUB_OWNER || !env.GITHUB_REPO) throw new HttpError(503, 'Chưa cấu hình quyền chạy quy trình GitHub Actions', 'GITHUB_NOT_CONFIGURED');
   const { value } = await readJson(request);
-  const workflows = { ci: 'ci-test.yml', workers: 'deploy-workers.yml', miniapp: 'deploy-miniapp.yml', web: 'deploy-web.yml', matrix: 'matrix-build.yml', scaffold: 'scaffold-feature.yml' };
+  const workflows = { ci: 'ci-test.yml', workers: 'deploy-workers.yml', miniapp: 'deploy-miniapp.yml', web: 'deploy-web.yml' };
   const workflow = workflows[String(value.workflow || '')];
-  if (!workflow) throw new HttpError(400, 'Workflow is not in the allowlist', 'WORKFLOW_NOT_ALLOWED');
-  if (workflow === 'scaffold-feature.yml') {
-    if (!/^[a-z][a-z0-9-]{1,39}$/.test(String(value.moduleName || '')) || !['api','bot','component'].includes(String(value.target || 'api'))) {
-      throw new HttpError(400, 'Invalid scaffold feature name or target', 'INVALID_SCAFFOLD_INPUT');
-    }
-  }
+  if (!workflow) throw new HttpError(400, 'Quy trình này không nằm trong danh sách được phép', 'WORKFLOW_NOT_ALLOWED');
   try {
-    const inputs = workflow === 'scaffold-feature.yml' ? { feature_name: String(value.moduleName || ''), target: String(value.target || 'api') } : {};
-    const result = await dispatchGitHubWorkflow(env, workflow, inputs);
+    const result = await dispatchGitHubWorkflow(env, workflow, {});
     await recordAudit(env, user.telegram_id, 'system.workflow_dispatch', 'workflow', workflow, {});
     return json({ ok: true, ...result }, 202);
   } catch (error) {
     console.warn('github_dispatch_failed', { workflow, error: String(error?.message || 'unknown').slice(0, 180) });
-    throw new HttpError(502, 'GitHub không chấp nhận yêu cầu chạy workflow', 'WORKFLOW_DISPATCH_FAILED');
+    throw new HttpError(502, 'GitHub không chấp nhận yêu cầu chạy quy trình', 'WORKFLOW_DISPATCH_FAILED');
   }
 }
 
