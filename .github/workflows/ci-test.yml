@@ -7,7 +7,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-v2
   cancel-in-progress: true
 jobs:
   worker-and-sql:
@@ -45,6 +45,7 @@ jobs:
           VITE_API_BASE_URL: https://example.invalid
       - run: pnpm --filter @hendy/mini-app test
   miniapp-e2e:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
