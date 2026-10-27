@@ -1,4 +1,0 @@
-export async function handle{{pascalName}}(request: Request, env: Env): Promise<Response> {
-  if (request.method === 'GET') return Response.json({ feature: '{{name}}', enabled: true });
-  return Response.json({ error: { code: 'METHOD_NOT_ALLOWED', message: 'Unsupported method' } }, { status: 405 });
-}
