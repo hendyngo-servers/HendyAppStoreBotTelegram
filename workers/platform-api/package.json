@@ -15,6 +15,6 @@
     "wrangler": "^4.45.0"
   },
   "dependencies": {
-    "libsodium-wrappers": "^0.7.15"
+    "libsodium-wrappers": "^0.8.4"
   }
 }
