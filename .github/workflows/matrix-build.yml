@@ -15,7 +15,7 @@ jobs:
     outputs:
       matrix: ${{ steps.detect.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: detect
         shell: bash
         env:
@@ -44,7 +44,7 @@ jobs:
       matrix: ${{ fromJson(needs.detect-native-projects.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Native release integration contract
         run: echo "Native project found for ${{ matrix.platform }}. Add platform-specific signing/build steps and protected certificate secrets before release."
       - uses: actions/upload-artifact@v4
