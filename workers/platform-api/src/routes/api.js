@@ -5,6 +5,7 @@ import { hmacBytes, bytesToHex } from '../utils/crypto.js';
 import { signDownloadTicket, verifyDownloadTicket } from '../auth/ticket.js';
 import { routeFeatureApi, isMaintenanceEnabled, isFeatureEnabled } from './features.js';
 import { recordAudit } from '../services/d1-logger.js';
+import { dispatchGitHubWorkflow, getGitHubActionsVariables, listGitHubActionsSecretNames, syncGitHubActionsSecrets, syncGitHubActionsVariables } from '../services/github-api.js';
 
 const VND = new Intl.NumberFormat('vi-VN');
 
@@ -475,6 +476,217 @@ export async function handleBinaryDownload(request, env, url) {
 }
 
 
+
+const CONFIG_RULES = {
+  APP_URL: 'optional-url', ADMIN_URL: 'optional-url', STOREFRONT_URL: 'optional-url',
+  MINIAPP_PUBLIC_URL: 'optional-url', ADMIN_PUBLIC_URL: 'optional-url', STOREFRONT_PUBLIC_URL: 'optional-url',
+  MINIAPP_DOMAIN_OVERRIDE: 'optional-url', ADMIN_DOMAIN_OVERRIDE: 'optional-url', STOREFRONT_DOMAIN_OVERRIDE: 'optional-url',
+  VITE_API_BASE_URL: 'optional-url', CORS_ORIGINS: 'origins',
+  BOT_USERNAME: 'username',
+  MIN_DEPOSIT_VND: 'integer', MAX_DEPOSIT_VND: 'integer',
+  DAILY_CHECKIN_REWARD_VND: 'integer', REFERRAL_REWARD_VND: 'integer',
+  SESSION_TTL_SECONDS: 'integer', MAX_INIT_DATA_AGE_SECONDS: 'integer',
+  BANK_ID: 'short', BANK_ACCOUNT_NUMBER: 'account', BANK_ACCOUNT_NAME: 'name', BANK_SYNC_URL: 'optional-url',
+  TASKS_CONFIG_JSON: 'json', MINIGAME_CONFIG_JSON: 'json',
+  MAINTENANCE_MESSAGE: 'message', TASKS_ENABLED: 'boolean', MINIGAME_ENABLED: 'boolean',
+  AUTO_REDEPLOY_WORKERS_AFTER_DOMAIN_SYNC: 'boolean',
+};
+const CONFIG_DEFAULTS = {
+  APP_URL: '', ADMIN_URL: '', STOREFRONT_URL: '',
+  MINIAPP_PUBLIC_URL: '', ADMIN_PUBLIC_URL: '', STOREFRONT_PUBLIC_URL: '',
+  MINIAPP_DOMAIN_OVERRIDE: '', ADMIN_DOMAIN_OVERRIDE: '', STOREFRONT_DOMAIN_OVERRIDE: '',
+  VITE_API_BASE_URL: '', CORS_ORIGINS: '',
+  BOT_USERNAME: '', MIN_DEPOSIT_VND: '10000', MAX_DEPOSIT_VND: '100000000',
+  DAILY_CHECKIN_REWARD_VND: '1000', REFERRAL_REWARD_VND: '2000',
+  SESSION_TTL_SECONDS: '3600', MAX_INIT_DATA_AGE_SECONDS: '86400',
+  BANK_ID: '', BANK_ACCOUNT_NUMBER: '', BANK_ACCOUNT_NAME: '', BANK_SYNC_URL: '',
+  TASKS_CONFIG_JSON: '{}', MINIGAME_CONFIG_JSON: '{}',
+  MAINTENANCE_MESSAGE: 'Hệ thống đang bảo trì, vui lòng quay lại sau.',
+  TASKS_ENABLED: 'true', MINIGAME_ENABLED: 'true',
+  AUTO_REDEPLOY_WORKERS_AFTER_DOMAIN_SYNC: 'true',
+};
+const SECRET_ALLOWLIST = new Set([
+  'BOT_TOKEN','BOT_WEBHOOK_SECRET','SESSION_SECRET','ADMIN_TELEGRAM_IDS',
+  'BANK_WEBHOOK_SECRET','BANK_API_KEY','BANK_API_SECRET','GITHUB_WEBHOOK_SECRET',
+  'CLOUDFLARE_API_TOKEN','CLOUDFLARE_ACCOUNT_ID','HENDY_GITHUB_TOKEN',
+  'ANDROID_KEYSTORE_BASE64','ANDROID_KEYSTORE_PASSWORD','ANDROID_KEY_ALIAS','ANDROID_KEY_PASSWORD',
+  'IOS_CERTIFICATE_BASE64','IOS_CERTIFICATE_PASSWORD','IOS_PROVISIONING_PROFILE_BASE64',
+  'WINDOWS_PFX_BASE64','WINDOWS_PFX_PASSWORD','MACOS_CERTIFICATE_BASE64','MACOS_CERTIFICATE_PASSWORD',
+  'APPLE_TEAM_ID','APPLE_ID','APPLE_APP_SPECIFIC_PASSWORD','R2_ACCESS_KEY_ID','R2_SECRET_ACCESS_KEY',
+  'SENTRY_AUTH_TOKEN',
+]);
+
+function validateCentralConfigValue(name, raw) {
+  const rule = CONFIG_RULES[name];
+  if (!rule) throw new HttpError(400, 'Unsupported configuration key', 'CONFIG_KEY_NOT_ALLOWED');
+  if (typeof raw !== 'string' && typeof raw !== 'number' && typeof raw !== 'boolean') {
+    throw new HttpError(400, 'Invalid value for ' + name, 'INVALID_CONFIG_VALUE');
+  }
+  let value = String(raw).trim();
+  if (value.length > 8000) throw new HttpError(400, 'Value for ' + name + ' is too long', 'CONFIG_VALUE_TOO_LONG');
+  if (rule === 'url' || rule === 'optional-url') {
+    if (!value && rule === 'optional-url') return '';
+    let parsed;
+    try { parsed = new URL(value); } catch { throw new HttpError(400, name + ' must be a valid URL', 'INVALID_CONFIG_URL'); }
+    if (!['https:','http:'].includes(parsed.protocol) || (parsed.protocol === 'http:' && !['localhost','127.0.0.1'].includes(parsed.hostname))) {
+      throw new HttpError(400, name + ' must use HTTPS (HTTP is allowed only for localhost)', 'INVALID_CONFIG_URL');
+    }
+    if (parsed.username || parsed.password || parsed.search || parsed.hash) throw new HttpError(400, name + ' cannot contain credentials, query parameters, or fragments', 'INVALID_CONFIG_URL');
+    return parsed.origin.replace(/\/$/, '');
+  }
+  if (rule === 'origins') {
+    if (!value) return '';
+    const origins = [...new Set(value.split(',').map((item) => item.trim()).filter(Boolean).map((item) => {
+      let parsed;
+      try { parsed = new URL(item); } catch { throw new HttpError(400, 'CORS_ORIGINS contains an invalid URL', 'INVALID_CORS_ORIGINS'); }
+      if (!['https:','http:'].includes(parsed.protocol) || (parsed.protocol === 'http:' && !['localhost','127.0.0.1'].includes(parsed.hostname)) || parsed.origin !== item.replace(/\/$/, '')) {
+        throw new HttpError(400, 'CORS_ORIGINS must contain origins only, without paths or query strings', 'INVALID_CORS_ORIGINS');
+      }
+      return parsed.origin;
+    }))];
+    if (origins.length > 10) throw new HttpError(400, 'CORS_ORIGINS supports at most 10 origins', 'INVALID_CORS_ORIGINS');
+    return origins.join(',');
+  }
+  if (rule === 'integer') {
+    if (!/^\d{1,12}$/.test(value)) throw new HttpError(400, name + ' must be an integer', 'INVALID_CONFIG_VALUE');
+    const number = Number(value);
+    const limits = {
+      MIN_DEPOSIT_VND: [1, 1000000000], MAX_DEPOSIT_VND: [1, 1000000000],
+      DAILY_CHECKIN_REWARD_VND: [0, 1000000], REFERRAL_REWARD_VND: [0, 1000000],
+      SESSION_TTL_SECONDS: [300, 86400], MAX_INIT_DATA_AGE_SECONDS: [60, 604800],
+    }[name] || [0, 1000000000];
+    if (!Number.isSafeInteger(number) || number < limits[0] || number > limits[1]) throw new HttpError(400, name + ' is outside the allowed range', 'CONFIG_VALUE_OUT_OF_RANGE');
+    return String(number);
+  }
+  if (rule === 'boolean') {
+    if (!['true','false'].includes(value.toLowerCase())) throw new HttpError(400, name + ' must be true or false', 'INVALID_CONFIG_VALUE');
+    return value.toLowerCase();
+  }
+  if (rule === 'json') {
+    if (!value) value = '{}';
+    let parsed;
+    try { parsed = JSON.parse(value); } catch { throw new HttpError(400, name + ' must be valid JSON', 'INVALID_CONFIG_JSON'); }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new HttpError(400, name + ' must be a JSON object', 'INVALID_CONFIG_JSON');
+    if (name === 'TASKS_CONFIG_JSON') {
+      const allowed = new Set(['maxActiveTasks','maxTargetCount','maxRewardVnd']);
+      if (Object.keys(parsed).some((key) => !allowed.has(key))) throw new HttpError(400, 'TASKS_CONFIG_JSON supports maxActiveTasks, maxTargetCount, and maxRewardVnd only', 'INVALID_CONFIG_JSON');
+      const ranges = { maxActiveTasks: [1, 100], maxTargetCount: [1, 100000], maxRewardVnd: [0, 1000000000] };
+      for (const [key, item] of Object.entries(parsed)) {
+        if (!Number.isSafeInteger(item) || item < ranges[key][0] || item > ranges[key][1]) throw new HttpError(400, 'Invalid numeric task limit: ' + key, 'INVALID_CONFIG_JSON');
+      }
+    }
+    if (name === 'MINIGAME_CONFIG_JSON' && parsed.prizes !== undefined) {
+      if (!Array.isArray(parsed.prizes) || parsed.prizes.length < 1 || parsed.prizes.length > 12) throw new HttpError(400, 'MINIGAME_CONFIG_JSON prizes must contain 1–12 entries', 'INVALID_CONFIG_JSON');
+      let totalThreshold = 0;
+      for (const prize of parsed.prizes) {
+        if (!prize || typeof prize !== 'object' || !/^[a-z][a-z0-9_-]{1,39}$/.test(String(prize.key || '')) ||
+          !Number.isSafeInteger(prize.threshold) || prize.threshold < 0 || prize.threshold > 1000 ||
+          !Number.isSafeInteger(prize.rewardVnd) || prize.rewardVnd < 0 || prize.rewardVnd > 1000000) {
+          throw new HttpError(400, 'Each minigame prize needs a valid key, threshold (0–1000), and rewardVnd (0–1000000)', 'INVALID_CONFIG_JSON');
+        }
+        totalThreshold += prize.threshold;
+      }
+      if (totalThreshold > 1000) throw new HttpError(400, 'Total minigame prize thresholds cannot exceed 1000', 'INVALID_CONFIG_JSON');
+    }
+    return JSON.stringify(parsed);
+  }
+  if (rule === 'username') {
+    value = value.replace(/^@/, '');
+    if (value && !/^[A-Za-z0-9_]{5,32}$/.test(value)) throw new HttpError(400, 'BOT_USERNAME is invalid', 'INVALID_BOT_USERNAME');
+    return value;
+  }
+  if (rule === 'account' && value && !/^\d{6,30}$/.test(value)) throw new HttpError(400, 'BANK_ACCOUNT_NUMBER must contain 6–30 digits', 'INVALID_BANK_ACCOUNT');
+  if (rule === 'short' && value && !/^[A-Za-z0-9_.-]{1,60}$/.test(value)) throw new HttpError(400, name + ' contains unsupported characters', 'INVALID_CONFIG_VALUE');
+  if (rule === 'name' && value.length > 120) throw new HttpError(400, name + ' is too long', 'INVALID_CONFIG_VALUE');
+  if (rule === 'message' && value.length > 2000) throw new HttpError(400, name + ' is too long', 'INVALID_CONFIG_VALUE');
+  return value;
+}
+
+async function adminCentralConfig(request, env) {
+  const { user } = await requireAdmin(request, env);
+  if (request.method === 'GET') {
+    const { results: rows } = await env.DB.prepare('SELECT config_key,value_json,updated_by,updated_at FROM central_configs ORDER BY config_key').all();
+    const values = { ...CONFIG_DEFAULTS };
+    const metadata = {};
+    for (const row of rows) {
+      if (!Object.hasOwn(CONFIG_RULES, row.config_key)) continue;
+      try { values[row.config_key] = String(JSON.parse(row.value_json)); } catch { values[row.config_key] = String(row.value_json); }
+      metadata[row.config_key] = { updatedBy: row.updated_by, updatedAt: row.updated_at };
+    }
+    let githubVariablesAvailable = false;
+    let githubSecretsAvailable = false;
+    let secretNames = [];
+    try {
+      const variables = await getGitHubActionsVariables(env);
+      Object.assign(values, variables);
+      githubVariablesAvailable = true;
+    } catch { /* Keep D1/default values visible when GitHub integration is not configured. */ }
+    try {
+      secretNames = await listGitHubActionsSecretNames(env);
+      githubSecretsAvailable = true;
+    } catch { /* Never return secret values; a name inventory is optional when GitHub is unavailable. */ }
+    const { results: secretMeta } = await env.DB.prepare('SELECT secret_key,updated_by,updated_at FROM central_config_secrets ORDER BY secret_key').all();
+    const secretKeys = [...new Set([...secretNames, ...secretMeta.map((row) => row.secret_key)])];
+    const secretStatus = Object.fromEntries(secretKeys.map((name) => [name, {
+      configured: secretNames.includes(name),
+      updatedAt: secretMeta.find((row) => row.secret_key === name)?.updated_at || null,
+    }]));
+    return json({
+      values, metadata, secretStatus, githubVariablesAvailable, githubSecretsAvailable,
+      secretKeys: [...SECRET_ALLOWLIST],
+      deploymentTargets: ['domains','workers','web','miniapp','secrets'],
+    });
+  }
+  if (request.method !== 'POST') throw new HttpError(405, 'Method not allowed', 'METHOD_NOT_ALLOWED');
+  const { value } = await readJson(request, 64 * 1024);
+  if (!value.values || typeof value.values !== 'object' || Array.isArray(value.values)) throw new HttpError(400, 'values must be an object', 'INVALID_CONFIG');
+  const keys = Object.keys(value.values);
+  if (!keys.length || keys.length > Object.keys(CONFIG_RULES).length) throw new HttpError(400, 'Provide at least one supported configuration value', 'INVALID_CONFIG');
+  const normalized = {};
+  for (const key of keys) normalized[key] = validateCentralConfigValue(key, value.values[key]);
+  let synced;
+  try { synced = await syncGitHubActionsVariables(env, normalized); }
+  catch { throw new HttpError(502, 'Could not sync configuration to GitHub Actions. Check the repository token has Actions variables read/write permissions.', 'GITHUB_VARIABLE_SYNC_FAILED'); }
+  const now = nowSeconds();
+  await env.DB.batch([
+    ...Object.entries(normalized).map(([key, val]) => env.DB.prepare('INSERT INTO central_configs(config_key,value_json,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(config_key) DO UPDATE SET value_json=excluded.value_json,updated_by=excluded.updated_by,updated_at=excluded.updated_at').bind(key, JSON.stringify(val), user.telegram_id, now)),
+    ...('MAINTENANCE_MESSAGE' in normalized ? [env.DB.prepare("INSERT INTO bot_configs(config_key,value_json,updated_by,updated_at) VALUES('maintenance_message',?,?,?) ON CONFLICT(config_key) DO UPDATE SET value_json=excluded.value_json,updated_by=excluded.updated_by,updated_at=excluded.updated_at").bind(JSON.stringify(normalized.MAINTENANCE_MESSAGE), user.telegram_id, now)] : []),
+    ...('DAILY_CHECKIN_REWARD_VND' in normalized ? [env.DB.prepare("INSERT INTO bot_configs(config_key,value_json,updated_by,updated_at) VALUES('daily_checkin_reward_vnd',?,?,?) ON CONFLICT(config_key) DO UPDATE SET value_json=excluded.value_json,updated_by=excluded.updated_by,updated_at=excluded.updated_at").bind(JSON.stringify(Number(normalized.DAILY_CHECKIN_REWARD_VND)), user.telegram_id, now)] : []),
+    ...('REFERRAL_REWARD_VND' in normalized ? [env.DB.prepare("INSERT INTO bot_configs(config_key,value_json,updated_by,updated_at) VALUES('referral_reward_vnd',?,?,?) ON CONFLICT(config_key) DO UPDATE SET value_json=excluded.value_json,updated_by=excluded.updated_by,updated_at=excluded.updated_at").bind(JSON.stringify(Number(normalized.REFERRAL_REWARD_VND)), user.telegram_id, now)] : []),
+    ...('MINIGAME_ENABLED' in normalized ? [env.DB.prepare("INSERT INTO bot_configs(config_key,value_json,updated_by,updated_at) VALUES('minigame_enabled',?,?,?) ON CONFLICT(config_key) DO UPDATE SET value_json=excluded.value_json,updated_by=excluded.updated_by,updated_at=excluded.updated_at").bind(JSON.stringify(normalized.MINIGAME_ENABLED === 'true'), user.telegram_id, now), env.DB.prepare("UPDATE feature_flags SET enabled=?,updated_by=?,updated_at=? WHERE flag_key='minigame'").bind(normalized.MINIGAME_ENABLED === 'true' ? 1 : 0, user.telegram_id, now)] : []),
+    ...('TASKS_CONFIG_JSON' in normalized ? [env.DB.prepare("INSERT INTO bot_configs(config_key,value_json,updated_by,updated_at) VALUES('tasks_config_json',?,?,?) ON CONFLICT(config_key) DO UPDATE SET value_json=excluded.value_json,updated_by=excluded.updated_by,updated_at=excluded.updated_at").bind(JSON.stringify(JSON.parse(normalized.TASKS_CONFIG_JSON)), user.telegram_id, now)] : []),
+    ...('MINIGAME_CONFIG_JSON' in normalized ? [env.DB.prepare("INSERT INTO bot_configs(config_key,value_json,updated_by,updated_at) VALUES('minigame_config_json',?,?,?) ON CONFLICT(config_key) DO UPDATE SET value_json=excluded.value_json,updated_by=excluded.updated_by,updated_at=excluded.updated_at").bind(JSON.stringify(JSON.parse(normalized.MINIGAME_CONFIG_JSON)), user.telegram_id, now)] : []),
+    ...('TASKS_ENABLED' in normalized ? [env.DB.prepare("UPDATE feature_flags SET enabled=?,updated_by=?,updated_at=? WHERE flag_key='tasks'").bind(normalized.TASKS_ENABLED === 'true' ? 1 : 0, user.telegram_id, now)] : []),
+    env.DB.prepare('INSERT INTO audit_logs(actor_telegram_id,action,target_type,target_id,details_json,created_at) VALUES(?,?,?,?,?,?)')
+      .bind(user.telegram_id, 'config.update', 'central_config', 'runtime', JSON.stringify({ keys: Object.keys(normalized) }), now),
+  ]);
+  return json({ ok: true, updatedKeys: Object.keys(normalized), syncedVariables: synced, updatedAt: now });
+}
+
+async function adminConfigApply(request, env) {
+  const { user } = await requireAdmin(request, env);
+  const { value } = await readJson(request);
+  if (value.confirm !== true) throw new HttpError(400, 'Confirm before dispatching deployment workflows', 'DEPLOY_CONFIRMATION_REQUIRED');
+  const requested = value.targets;
+  if (!Array.isArray(requested) || !requested.length || requested.some((target) => !['domains','workers','web','miniapp','secrets'].includes(target))) {
+    throw new HttpError(400, 'Select one or more supported deployment targets', 'INVALID_DEPLOYMENT_TARGETS');
+  }
+  const mapping = { domains: ['sync-domains.yml', {}], workers: ['deploy-workers.yml', {}], web: ['deploy-web.yml', {}], miniapp: ['deploy-miniapp.yml', {}], secrets: ['secrets-sync.yml', { confirm: 'SYNC' }] };
+  const dispatched = [];
+  for (const target of [...new Set(requested)]) {
+    const entry = mapping[target];
+    try {
+      await dispatchGitHubWorkflow(env, entry[0], entry[1]);
+      dispatched.push({ target: target, workflow: entry[0], ref: 'main' });
+    } catch {
+      await recordAudit(env, user.telegram_id, 'config.apply_partial_failure', 'workflow', entry[0], { dispatched: dispatched.map((item) => item.workflow) });
+      return json({ ok: false, dispatched, error: 'Could not dispatch ' + entry[0] + '; verify GitHub Actions workflow permissions.' }, 502);
+    }
+  }
+  await recordAudit(env, user.telegram_id, 'config.apply', 'workflows', dispatched.map((item) => item.workflow).join(','), { targets: dispatched.map((item) => item.target) });
+  return json({ ok: true, dispatched, message: 'Workflow đã được gửi đi; hãy theo dõi GitHub Actions để xác nhận kết quả triển khai.' });
+}
+
 export async function routeApi(request, env, url) {
   const path = url.pathname; const method = request.method.toUpperCase();
   if (path.startsWith('/api/') && !path.startsWith('/api/admin/')) {
@@ -500,6 +712,8 @@ export async function routeApi(request, env, url) {
     const { raw } = await readJson(request, 128 * 1024);
     return bankWebhook(request, env, raw);
   }
+  if (path === '/api/admin/config' && ['GET','POST'].includes(method)) return adminCentralConfig(request, env);
+  if (path === '/api/admin/config/apply' && method === 'POST') return adminConfigApply(request, env);
   if (path === '/api/admin/overview' && method === 'GET') return adminOverview(request, env);
   if (path === '/api/admin/products' && ['GET','POST'].includes(method)) return adminProducts(request, env);
   if (path === '/api/admin/inventory' && method === 'POST') return adminStock(request, env);
