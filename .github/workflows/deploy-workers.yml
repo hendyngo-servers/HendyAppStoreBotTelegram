@@ -43,6 +43,8 @@ jobs:
       TASKS_CONFIG_JSON: ${{ vars.TASKS_CONFIG_JSON }}
       MINIGAME_CONFIG_JSON: ${{ vars.MINIGAME_CONFIG_JSON }}
     steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 10.18.0
       - uses: actions/setup-node@v4
