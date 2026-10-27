@@ -35,6 +35,6 @@ A PNPM monorepo for the Telegram shop, adaptive application storefront, admin st
 
 Build frontends separately; deploy each Worker from its own Wrangler config. The first release uses a modular REST API rather than splitting every route into a separate Worker. Queue consumers and the Telegram webhook are separated because their execution and trust boundaries differ.
 
-## Native release limitation
+## Giới hạn phát hành ứng dụng native
 
-The repository contains native build workflow scaffolding only. Real APK/AAB, IPA, EXE/MSIX, DMG/PKG builds require actual native project source, platform-specific build/sign steps, registered certificates/profiles, and Apple notarization where required. The workflow explicitly does not fabricate binaries when native source is absent.
+Repo hiện không chứa project native Android/iOS/Windows/macOS và không tự biên dịch hoặc ký APK/AAB, IPA, EXE/MSIX, DMG/PKG. Không có binary mẫu/giả được tạo ra. Hãy build và ký bằng toolchain của từng nền tảng, kiểm tra chữ ký và quyền phân phối, rồi tải artifact thật qua Admin Studio. iOS/macOS cần cấu hình profile/chứng chỉ và notarization theo yêu cầu của Apple.
