@@ -1,2 +1,0 @@
-import React from 'react';
-export default function BotManager(){return <section className="panel"><h2>Bot Manager</h2><p>Quản lý token BotFather qua Cloudflare Worker secret và cập nhật webhook bằng script triển khai. Token không được đọc hoặc trả về trình duyệt.</p><p>Webhook phải dùng header secret token; chỉ cấu hình trạng thái bot và public metadata ở giao diện quản trị.</p><a href="https://core.telegram.org/bots/api#setwebhook" target="_blank" rel="noreferrer">Tài liệu Telegram setWebhook</a></section>}

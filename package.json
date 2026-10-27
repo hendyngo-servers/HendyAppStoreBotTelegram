@@ -26,7 +26,6 @@
     "build": "pnpm -r --if-present build",
     "test": "pnpm --filter @hendy/platform-api test && python scripts/test_db.py && node --test packages/feature-flags/test/*.test.js && pnpm --filter @hendy/mini-app test",
     "check": "pnpm --filter @hendy/platform-api check && node scripts/check-workspace.js",
-    "generate:module": "node scripts/scaffold/generate-module.js",
     "migrate:local": "pnpm --filter @hendy/platform-api migrate:local",
     "migrate:remote": "pnpm --filter @hendy/platform-api migrate:remote",
     "prepare": "husky",

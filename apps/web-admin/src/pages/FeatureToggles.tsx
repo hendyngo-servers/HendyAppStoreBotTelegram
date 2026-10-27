@@ -28,11 +28,11 @@ export default function FeatureToggles({ token }: { token: string }) {
     } catch (e) { setError((e as Error).message); }
     finally { setBusy(null); }
   }
-  return <section className="panel"><h2>Feature Toggles</h2><p>Bật/tắt tính năng và triển khai theo tỷ lệ phần trăm. Mọi thay đổi được lưu trong D1 và audit log.</p>
+  return <section className="panel"><h2>Cấu hình tính năng</h2><p>Bật/tắt tính năng và triển khai theo tỷ lệ phần trăm. Mọi thay đổi được lưu trong D1 và audit log.</p>
     {error && <p role="alert" className="error-text">{error}</p>}
     {flags.map((flag) => <article className="setting-row" key={flag.flag_key}>
-      <div className="setting-info"><b>{flag.flag_key}</b><p>{flag.description || 'Không có mô tả'}</p><label className="rollout-label">Rollout: {flag.rollout_percent}%
-        <input aria-label={`Rollout ${flag.flag_key}`} type="range" min="0" max="100" step="5" value={flag.rollout_percent} disabled={busy === flag.flag_key || !flag.enabled} onChange={(event) => setFlags((rows) => rows.map((row) => row.flag_key === flag.flag_key ? { ...row, rollout_percent: Number(event.target.value) } : row))} />
+      <div className="setting-info"><b>{flag.flag_key}</b><p>{flag.description || 'Không có mô tả'}</p><label className="rollout-label">Tỷ lệ triển khai: {flag.rollout_percent}%
+        <input aria-label={`Tỷ lệ triển khai ${flag.flag_key}`} type="range" min="0" max="100" step="5" value={flag.rollout_percent} disabled={busy === flag.flag_key || !flag.enabled} onChange={(event) => setFlags((rows) => rows.map((row) => row.flag_key === flag.flag_key ? { ...row, rollout_percent: Number(event.target.value) } : row))} />
       </label><button className="secondary-action" disabled={busy === flag.flag_key || !flag.enabled} onClick={() => save(flag, { rollout_percent: flag.rollout_percent })}>Lưu rollout</button></div>
       <button disabled={busy === flag.flag_key} onClick={() => save(flag, { enabled: flag.enabled ? 0 : 1 })}>{busy === flag.flag_key ? 'Đang lưu…' : flag.enabled ? 'Đang bật' : 'Đang tắt'}</button>
     </article>)}
