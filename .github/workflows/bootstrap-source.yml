@@ -13,7 +13,6 @@ concurrency:
   cancel-in-progress: false
 jobs:
   hydrate:
-    if: ${{ hashFiles('.bootstrap/chunk-00.b64') != '' }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out bootstrap branch
@@ -21,7 +20,17 @@ jobs:
         with:
           ref: bootstrap/full-source
           persist-credentials: true
+      - name: Check bootstrap payload
+        id: gate
+        shell: bash
+        run: |
+          if [[ -f .bootstrap/chunk-00.b64 ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Restore source archive
+        if: steps.gate.outputs.present == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -33,10 +42,12 @@ jobs:
           rm -rf .bootstrap
           rm -f .github/workflows/bootstrap-source.yml
       - name: Set up Node
+        if: steps.gate.outputs.present == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 22
       - name: Validate workspace and database
+        if: steps.gate.outputs.present == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -44,6 +55,7 @@ jobs:
           python3 scripts/test_db.py
           node --test packages/feature-flags/test/*.test.js
       - name: Commit complete source tree
+        if: steps.gate.outputs.present == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -53,6 +65,7 @@ jobs:
           git commit -m "feat: add complete source tree and advanced features"
           git push origin HEAD:bootstrap/full-source
       - name: Open pull request
+        if: steps.gate.outputs.present == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
