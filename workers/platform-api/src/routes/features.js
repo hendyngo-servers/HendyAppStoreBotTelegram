@@ -87,9 +87,11 @@ async function dailyCheckin(request, env) {
 async function listTasks(request, env) {
   const { user } = await requireSession(request, env);
   if (!await isFeatureEnabled(env, 'tasks', user.telegram_id)) throw new HttpError(404, 'Tasks are disabled', 'FEATURE_DISABLED');
+  const taskConfig = await readConfig(env, 'tasks_config_json', {});
+  const maxItems = Math.max(1, Math.min(100, Number(taskConfig?.maxActiveTasks || 20)));
   const rows = (await env.DB.prepare(`SELECT t.id,t.title,t.description,t.task_type,t.target_count,t.reward_vnd,t.is_active,
     COALESCE(ut.status,'in_progress') AS status,COALESCE(ut.progress_count,0) AS manual_progress
-    FROM tasks t LEFT JOIN user_tasks ut ON ut.task_id=t.id AND ut.user_id=? WHERE t.is_active=1 ORDER BY t.created_at DESC LIMIT 100`).bind(user.id).all()).results;
+    FROM tasks t LEFT JOIN user_tasks ut ON ut.task_id=t.id AND ut.user_id=? WHERE t.is_active=1 ORDER BY t.created_at DESC LIMIT ?`).bind(user.id, maxItems).all()).results;
   const items = await Promise.all(rows.map(async (task) => {
     let progress = Number(task.manual_progress || 0);
     if (task.task_type === 'referrals') progress = (await env.DB.prepare('SELECT COUNT(*) AS count FROM referrals WHERE referrer_user_id=?').bind(user.id).first()).count;
@@ -142,7 +144,17 @@ async function playMinigame(request, env) {
   const random = new Uint32Array(1);
   crypto.getRandomValues(random);
   const roll = random[0] % 1000;
-  const prize = roll < 5 ? { key: 'jackpot', reward: 5000 } : roll < 55 ? { key: 'bonus', reward: 1000 } : roll < 205 ? { key: 'small', reward: 200 } : { key: 'try_again', reward: 0 };
+  const gameConfig = await readConfig(env, 'minigame_config_json', {});
+  let prize = null;
+  if (Array.isArray(gameConfig?.prizes) && gameConfig.prizes.length) {
+    let threshold = 0;
+    for (const item of gameConfig.prizes) {
+      threshold += Number(item.threshold || 0);
+      if (roll < threshold) { prize = { key: String(item.key), reward: Number(item.rewardVnd || 0) }; break; }
+    }
+  }
+  if (!prize && Array.isArray(gameConfig?.prizes)) { const fallback = gameConfig.prizes.find((item) => item.key === 'try_again'); if (fallback) prize = { key: String(fallback.key), reward: Number(fallback.rewardVnd || 0) }; }
+  if (!prize) prize = roll < 5 ? { key: 'jackpot', reward: 5000 } : roll < 55 ? { key: 'bonus', reward: 1000 } : roll < 205 ? { key: 'small', reward: 200 } : { key: 'try_again', reward: 0 };
   const now = nowSeconds();
   const spinResults = await env.DB.batch([
     env.DB.prepare('INSERT OR IGNORE INTO minigame_spins(user_id,day_key,prize_key,reward_vnd,created_at) VALUES(?,?,?,?,?)').bind(user.id, day, prize.key, prize.reward, now),
@@ -180,9 +192,12 @@ async function adminTasks(request, env) {
   const title = assertString(value.title, 'title', 160);
   const description = typeof value.description === 'string' ? value.description.slice(0, 2000) : '';
   const type = ['manual','referrals','purchases'].includes(value.taskType) ? value.taskType : 'manual';
+  const taskConfig = await readConfig(env, 'tasks_config_json', {});
+  const maxTarget = Math.max(1, Math.min(100000, Number(taskConfig?.maxTargetCount || 100000)));
+  const maxReward = Math.max(0, Math.min(1000000000, Number(taskConfig?.maxRewardVnd ?? 1000000000)));
   const target = Number(value.targetCount || 1);
   const reward = Number(value.rewardVnd);
-  if (!Number.isInteger(target) || target < 1 || target > 100000 || !Number.isSafeInteger(reward) || reward < 0 || reward > 1000000000) {
+  if (!Number.isInteger(target) || target < 1 || target > maxTarget || !Number.isSafeInteger(reward) || reward < 0 || reward > maxReward) {
     throw new HttpError(400, 'Invalid targetCount or rewardVnd', 'INVALID_TASK');
   }
   const now = nowSeconds();
@@ -251,11 +266,11 @@ async function adminBroadcast(request, env) {
 const MANAGED_GITHUB_SECRET_KEYS = new Set([
   'BOT_TOKEN','BOT_WEBHOOK_SECRET','SESSION_SECRET','ADMIN_TELEGRAM_IDS',
   'BANK_WEBHOOK_SECRET','BANK_API_KEY','BANK_API_SECRET','GITHUB_WEBHOOK_SECRET',
-  'CLOUDFLARE_API_TOKEN','CLOUDFLARE_ACCOUNT_ID',
+  'CLOUDFLARE_API_TOKEN','CLOUDFLARE_ACCOUNT_ID','HENDY_GITHUB_TOKEN',
   'ANDROID_KEYSTORE_BASE64','ANDROID_KEYSTORE_PASSWORD','ANDROID_KEY_ALIAS','ANDROID_KEY_PASSWORD',
   'IOS_CERTIFICATE_BASE64','IOS_CERTIFICATE_PASSWORD','IOS_PROVISIONING_PROFILE_BASE64',
   'WINDOWS_PFX_BASE64','WINDOWS_PFX_PASSWORD','MACOS_CERTIFICATE_BASE64','MACOS_CERTIFICATE_PASSWORD',
-  'APPLE_TEAM_ID','APPLE_ID','APPLE_APP_SPECIFIC_PASSWORD','R2_ACCESS_KEY_ID','R2_SECRET_ACCESS_KEY',
+  'APPLE_TEAM_ID','APPLE_ID','APPLE_APP_SPECIFIC_PASSWORD','R2_ACCESS_KEY_ID','R2_SECRET_ACCESS_KEY','SENTRY_AUTH_TOKEN',
 ]);
 
 async function adminSyncGitHubSecrets(request, env) {
@@ -264,7 +279,7 @@ async function adminSyncGitHubSecrets(request, env) {
   if (value.confirm !== true) throw new HttpError(400, 'Explicit confirmation is required before syncing repository secrets', 'SYNC_CONFIRMATION_REQUIRED');
   if (!value.secrets || typeof value.secrets !== 'object' || Array.isArray(value.secrets)) throw new HttpError(400, 'secrets must be an object', 'INVALID_SECRETS');
   const entries = Object.entries(value.secrets);
-  if (entries.length < 1 || entries.length > MANAGED_GITHUB_SECRET_KEYS.size) throw new HttpError(400, 'Provide between 1 and 26 secrets', 'INVALID_SECRETS_COUNT');
+  if (entries.length < 1 || entries.length > MANAGED_GITHUB_SECRET_KEYS.size) throw new HttpError(400, 'Provide at least one supported secret', 'INVALID_SECRETS_COUNT');
   const secrets = {};
   for (const [name, secret] of entries) {
     if (!MANAGED_GITHUB_SECRET_KEYS.has(name)) throw new HttpError(400, `Secret key is not in the allowlist: ${name}`, 'SECRET_KEY_NOT_ALLOWED');
@@ -279,6 +294,8 @@ async function adminSyncGitHubSecrets(request, env) {
     console.warn('github_secret_sync_failed', { error: String(error?.message || 'unknown').slice(0, 180), count: entries.length });
     throw new HttpError(502, 'Không thể đồng bộ secrets lên GitHub. Kiểm tra token/quyền Actions và public key repo.', 'GITHUB_SECRET_SYNC_FAILED');
   }
+  const now = nowSeconds();
+  await env.DB.batch(synced.map((name) => env.DB.prepare('INSERT INTO central_config_secrets(secret_key,updated_by,updated_at) VALUES(?,?,?) ON CONFLICT(secret_key) DO UPDATE SET updated_by=excluded.updated_by,updated_at=excluded.updated_at').bind(name, user.telegram_id, now)));
   await recordAudit(env, user.telegram_id, 'github.secrets_sync', 'repository', `${env.GITHUB_OWNER}/${env.GITHUB_REPO}`, { keys: synced, count: synced.length });
   return json({ ok: true, count: synced.length, syncedKeys: synced });
 }

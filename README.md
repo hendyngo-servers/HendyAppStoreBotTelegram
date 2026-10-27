@@ -6,14 +6,14 @@ Monorepo cho Telegram Mini App + bot shop + API/Cloudflare Workers + Admin Studi
 
 - `apps/mini-app`: Telegram Mini App (React + TypeScript + Vite), shop code, nạp tiền, lịch sử, nhiệm vụ, điểm danh, vòng quay, referral, notifications và profile.
 - `apps/web-user`: cổng phát hành theo thiết bị, các giao diện tải binary Android/iOS/Windows/macOS.
-- `apps/web-admin`: bảng điều khiển sản phẩm, người dùng, broadcast, bot, bảo trì, feature flags, GitHub secrets, module scaffold, release và build matrix.
+- `apps/web-admin`: bảng điều khiển sản phẩm, người dùng, broadcast, bot, bảo trì, feature flags, trung tâm cấu hình/domain sync, GitHub secrets, module scaffold, release và build matrix.
 - `workers/platform-api`: xác thực Telegram, shop/wallet, deposit webhook adapter, task/referral/reward APIs, feature flags, releases và quản trị.
 - `workers/telegram-bot`: Telegram webhook + command dispatcher. Đây là Worker duy nhất nên nhận webhook bot.
 - `workers/queue-processor`: broadcast/retry/queue + dead-letter handling.
 - `workers/edge-router`: định tuyến theo thiết bị, layout resolver và maintenance guard.
 - `workers/self-healing-bot`: xác thực GitHub webhook và rerun workflow trong allowlist.
 - `packages/feature-flags`, `packages/types`, `packages/shared-hooks`, `packages/shared-ui`, `packages/logger`: mã dùng chung.
-- `database/migrations`: migrations tăng dần `0001`–`0008`; không sửa migration đã chạy trên production, hãy thêm migration mới.
+- `database/migrations`: migrations tăng dần `0001`–`0009`; không sửa migration đã chạy trên production, hãy thêm migration mới.
 - `.github/workflows`: CI, deploy, security scan, native build dispatch, secret sync và feature scaffold PR.
 
 ## Requirements
@@ -66,6 +66,7 @@ Làm theo [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md), cấu hình GitHub Environme
 - [Deployment runbook](docs/DEPLOYMENT.md)
 - [Security](docs/SECURITY.md)
 - [Environment variables](docs/ENVIRONMENT.md)
+- [Central Configuration Control Plane](docs/CENTRAL-CONFIG.md)
 - [Review report](docs/REVIEW-REPORT.md)
 
 ## Import source into GitHub

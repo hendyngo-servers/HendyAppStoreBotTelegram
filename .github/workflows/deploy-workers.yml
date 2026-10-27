@@ -4,6 +4,8 @@ on:
     branches: [main]
     paths:
       - 'workers/**'
+      - 'scripts/configure-wrangler.mjs'
+      - 'scripts/sync-deployment-domains.mjs'
       - 'database/migrations/**'
       - 'packages/**'
       - 'pnpm-workspace.yaml'
@@ -24,6 +26,22 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_D1_DATABASE_ID: ${{ vars.CLOUDFLARE_D1_DATABASE_ID }}
       CLOUDFLARE_DEDUPE_KV_NAMESPACE_ID: ${{ vars.CLOUDFLARE_DEDUPE_KV_NAMESPACE_ID }}
+      APP_URL: ${{ vars.APP_URL }}
+      ADMIN_URL: ${{ vars.ADMIN_URL }}
+      CORS_ORIGINS: ${{ vars.CORS_ORIGINS }}
+      BOT_USERNAME: ${{ vars.BOT_USERNAME }}
+      MIN_DEPOSIT_VND: ${{ vars.MIN_DEPOSIT_VND }}
+      MAX_DEPOSIT_VND: ${{ vars.MAX_DEPOSIT_VND }}
+      DAILY_CHECKIN_REWARD_VND: ${{ vars.DAILY_CHECKIN_REWARD_VND }}
+      REFERRAL_REWARD_VND: ${{ vars.REFERRAL_REWARD_VND }}
+      SESSION_TTL_SECONDS: ${{ vars.SESSION_TTL_SECONDS }}
+      MAX_INIT_DATA_AGE_SECONDS: ${{ vars.MAX_INIT_DATA_AGE_SECONDS }}
+      BANK_ID: ${{ vars.BANK_ID }}
+      BANK_ACCOUNT_NUMBER: ${{ vars.BANK_ACCOUNT_NUMBER }}
+      BANK_ACCOUNT_NAME: ${{ vars.BANK_ACCOUNT_NAME }}
+      BANK_SYNC_URL: ${{ vars.BANK_SYNC_URL }}
+      TASKS_CONFIG_JSON: ${{ vars.TASKS_CONFIG_JSON }}
+      MINIGAME_CONFIG_JSON: ${{ vars.MINIGAME_CONFIG_JSON }}
     steps:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v4

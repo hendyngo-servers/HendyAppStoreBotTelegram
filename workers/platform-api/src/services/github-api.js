@@ -30,6 +30,52 @@ async function githubRequest(url, token, init = {}) {
   try { return JSON.parse(text); } catch { return null; }
 }
 
+const allowedVariableNames = new Set([
+  'APP_URL','ADMIN_URL','STOREFRONT_URL','MINIAPP_PUBLIC_URL','ADMIN_PUBLIC_URL','STOREFRONT_PUBLIC_URL',
+  'MINIAPP_DOMAIN_OVERRIDE','ADMIN_DOMAIN_OVERRIDE','STOREFRONT_DOMAIN_OVERRIDE','VITE_API_BASE_URL','CORS_ORIGINS',
+  'BOT_USERNAME','MIN_DEPOSIT_VND','MAX_DEPOSIT_VND','DAILY_CHECKIN_REWARD_VND','REFERRAL_REWARD_VND',
+  'SESSION_TTL_SECONDS','MAX_INIT_DATA_AGE_SECONDS','BANK_ID','BANK_ACCOUNT_NUMBER','BANK_ACCOUNT_NAME','BANK_SYNC_URL',
+  'TASKS_CONFIG_JSON','MINIGAME_CONFIG_JSON','MAINTENANCE_MESSAGE','TASKS_ENABLED','MINIGAME_ENABLED',
+  'AUTO_REDEPLOY_WORKERS_AFTER_DOMAIN_SYNC'
+]);
+
+export async function getGitHubActionsVariables(env) {
+  if (!env.GITHUB_TOKEN) throw new Error('GitHub token is not configured');
+  const payload = await githubRequest(repositoryPath(env, '/actions/variables?per_page=100'), env.GITHUB_TOKEN);
+  const variables = Array.isArray(payload?.variables) ? payload.variables : [];
+  return Object.fromEntries(variables.filter((item) => allowedVariableNames.has(item.name)).map((item) => [item.name, String(item.value ?? '')]));
+}
+
+export async function syncGitHubActionsVariables(env, variables) {
+  if (!env.GITHUB_TOKEN) throw new Error('GitHub token is not configured');
+  const entries = Object.entries(variables || {});
+  if (!entries.length) return [];
+  for (const [name, value] of entries) {
+    if (!allowedVariableNames.has(name)) throw new Error('GitHub Actions variable is not allowlisted');
+    if (typeof value !== 'string' || value.length > 48000) throw new Error('GitHub Actions variable has an invalid value');
+  }
+  const payload = await githubRequest(repositoryPath(env, '/actions/variables?per_page=100'), env.GITHUB_TOKEN);
+  const existing = new Set((Array.isArray(payload?.variables) ? payload.variables : []).map((item) => item.name));
+  const synced = [];
+  for (const [name, value] of entries) {
+    const suffix = '/actions/variables/' + encodeURIComponent(name);
+    if (existing.has(name)) {
+      await githubRequest(repositoryPath(env, suffix), env.GITHUB_TOKEN, { method: 'PATCH', body: JSON.stringify({ name, value }) });
+    } else {
+      await githubRequest(repositoryPath(env, '/actions/variables'), env.GITHUB_TOKEN, { method: 'POST', body: JSON.stringify({ name, value }) });
+      existing.add(name);
+    }
+    synced.push(name);
+  }
+  return synced;
+}
+
+export async function listGitHubActionsSecretNames(env) {
+  if (!env.GITHUB_TOKEN) throw new Error('GitHub token is not configured');
+  const payload = await githubRequest(repositoryPath(env, '/actions/secrets?per_page=100'), env.GITHUB_TOKEN);
+  return (Array.isArray(payload?.secrets) ? payload.secrets : []).map((item) => item.name).filter((name) => /^[A-Z0-9_]{1,100}$/.test(name));
+}
+
 export async function syncGitHubActionsSecrets(env, secrets) {
   if (!env.GITHUB_TOKEN) throw new Error('GitHub token is not configured');
   const publicKey = await githubRequest(repositoryPath(env, '/actions/secrets/public-key'), env.GITHUB_TOKEN);

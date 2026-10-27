@@ -302,3 +302,19 @@ INSERT OR IGNORE INTO feature_flags(flag_key,description,enabled,rollout_percent
  ('tasks','Nhiệm vụ nhận thưởng',1,100,'system',unixepoch()),
  ('minigame','Vòng quay miễn phí mỗi ngày',1,100,'system',unixepoch()),
  ('app_releases','Cổng tải ứng dụng đa nền tảng',1,100,'system',unixepoch());
+
+-- ===== 0009_central_config.sql =====
+-- Store non-secret configuration only; credential values live in GitHub Actions Secrets.
+CREATE TABLE IF NOT EXISTS central_configs (
+  config_key TEXT PRIMARY KEY,
+  value_json TEXT NOT NULL,
+  updated_by TEXT,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS central_config_secrets (
+  secret_key TEXT PRIMARY KEY,
+  updated_by TEXT,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_central_configs_updated_at ON central_configs(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_central_config_secrets_updated_at ON central_config_secrets(updated_at DESC);

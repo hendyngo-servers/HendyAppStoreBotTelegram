@@ -4,6 +4,7 @@ on:
     branches: [main]
     paths:
       - 'apps/mini-app/**'
+      - 'scripts/sync-deployment-domains.mjs'
       - 'packages/**'
       - 'pnpm-workspace.yaml'
       - 'package.json'
@@ -34,3 +35,13 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Detect deployed domains and synchronize central configuration
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          HENDY_GITHUB_TOKEN: ${{ secrets.HENDY_GITHUB_TOKEN }}
+          MINIAPP_PAGES_PROJECT: ${{ vars.MINIAPP_PAGES_PROJECT || 'hendy-mini-app' }}
+          ADMIN_PAGES_PROJECT: ${{ vars.ADMIN_PAGES_PROJECT || 'hendy-web-admin' }}
+          STOREFRONT_PAGES_PROJECT: ${{ vars.STOREFRONT_PAGES_PROJECT || 'hendy-app-storefront' }}
+        run: node scripts/sync-deployment-domains.mjs miniapp
