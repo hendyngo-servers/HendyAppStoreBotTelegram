@@ -1,0 +1,68 @@
+name: Deploy Workers
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'workers/**'
+      - 'database/migrations/**'
+      - 'packages/**'
+      - 'pnpm-workspace.yaml'
+      - 'package.json'
+      - '.github/workflows/deploy-workers.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: workers-production
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_D1_DATABASE_ID: ${{ vars.CLOUDFLARE_D1_DATABASE_ID }}
+      CLOUDFLARE_DEDUPE_KV_NAMESPACE_ID: ${{ vars.CLOUDFLARE_DEDUPE_KV_NAMESPACE_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.18.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --no-frozen-lockfile
+      - run: pnpm check && pnpm test
+      - name: Configure resource identifiers
+        run: node scripts/configure-wrangler.mjs
+      - name: Ensure Cloudflare Queues exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          ensure_queue() {
+            local name="$1" output
+            if output="$(pnpm exec wrangler queues create "$name" 2>&1)"; then
+              printf '%s\\n' "$output"
+            elif printf '%s' "$output" | grep -Eqi 'already exists|already in use|queue.*exists'; then
+              printf 'Queue %s already exists.\\n' "$name"
+            else
+              printf '%s\\n' "$output" >&2
+              return 1
+            fi
+          }
+          ensure_queue hendy-jobs
+          ensure_queue hendy-jobs-dlq
+      - name: Apply D1 migrations
+        run: pnpm exec wrangler d1 migrations apply hendyappstore-db --remote --config workers/platform-api/wrangler.toml
+      - name: Deploy platform API
+        run: pnpm exec wrangler deploy --config workers/platform-api/wrangler.toml
+      - name: Deploy Telegram bot worker
+        run: pnpm exec wrangler deploy --config workers/telegram-bot/wrangler.toml
+      - name: Deploy queue processor
+        run: pnpm exec wrangler deploy --config workers/queue-processor/wrangler.toml
+      - name: Deploy edge router
+        run: pnpm exec wrangler deploy --config workers/edge-router/wrangler.toml
+      - name: Deploy self-healing bot
+        run: pnpm exec wrangler deploy --config workers/self-healing-bot/wrangler.toml

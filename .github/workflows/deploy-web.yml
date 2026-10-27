@@ -1,0 +1,42 @@
+name: Deploy Web Frontends
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/web-user/**'
+      - 'apps/web-admin/**'
+      - 'packages/**'
+      - 'pnpm-workspace.yaml'
+      - 'package.json'
+      - '.github/workflows/deploy-web.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: pages-web-production
+  cancel-in-progress: true
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.18.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --no-frozen-lockfile
+      - run: pnpm --filter @hendy/web-user build
+        env:
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+      - run: pnpm --filter @hendy/web-admin build
+        env:
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+      - run: pnpm exec wrangler pages deploy apps/web-user/dist --project-name "${{ vars.STOREFRONT_PAGES_PROJECT || 'hendy-app-storefront' }}" --branch main
+      - run: pnpm exec wrangler pages deploy apps/web-admin/dist --project-name "${{ vars.ADMIN_PAGES_PROJECT || 'hendy-web-admin' }}" --branch main
