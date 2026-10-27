@@ -167,8 +167,10 @@ async function bankWebhook(request, env, rawBody) {
   const result = await env.DB.batch([
     env.DB.prepare(`UPDATE users SET balance_vnd=balance_vnd+(SELECT amount_vnd FROM deposit_requests WHERE reference=? AND status='pending' AND amount_vnd=?), updated_at=?
       WHERE id=(SELECT user_id FROM deposit_requests WHERE reference=? AND status='pending' AND amount_vnd=?)
-      AND EXISTS(SELECT 1 FROM deposit_requests WHERE reference=? AND status='pending' AND amount_vnd=?)`)
-      .bind(reference, amount, now, reference, amount, reference, amount),
+      AND EXISTS(SELECT 1 FROM deposit_requests WHERE reference=? AND status='pending' AND amount_vnd=?)
+      AND NOT EXISTS(SELECT 1 FROM bank_webhook_events WHERE provider_tx_id=?)
+      AND NOT EXISTS(SELECT 1 FROM deposit_requests WHERE provider_tx_id=?)`)
+      .bind(reference, amount, now, reference, amount, reference, amount, transactionId, transactionId),
     env.DB.prepare(`UPDATE deposit_requests SET status='credited',provider_tx_id=?,updated_at=? WHERE reference=? AND status='pending' AND amount_vnd=? AND changes()=1`)
       .bind(transactionId, now, reference, amount),
     env.DB.prepare(`INSERT OR IGNORE INTO bank_webhook_events(provider_tx_id,reference,raw_event_hash,received_at)
