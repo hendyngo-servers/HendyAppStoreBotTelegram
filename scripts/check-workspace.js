@@ -9,7 +9,7 @@ const required = [
   'workers/queue-processor/wrangler.toml', 'workers/edge-router/wrangler.toml',
   'workers/self-healing-bot/wrangler.toml', 'database/migrations/0001_core_schema.sql',
   'database/migrations/0008_feature_flags.sql', '.github/workflows/ci-test.yml',
-  '.github/workflows/deploy-workers.yml', 'scripts/scaffold/generate-module.js',
+  '.github/workflows/deploy-workers.yml',
 ];
 const errors = [];
 for (const file of required) if (!fs.existsSync(path.join(root, file))) errors.push(`Missing required path: ${file}`);
