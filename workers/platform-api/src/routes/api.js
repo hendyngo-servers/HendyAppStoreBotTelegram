@@ -1,0 +1,526 @@
+import { HttpError, readJson, assertString, nowSeconds, json, safeEqual } from '../utils/http.js';
+import { validateTelegramInitData } from '../auth/telegram.js';
+import { signSession, requireSession, requireAdmin, isAdmin } from '../auth/session.js';
+import { hmacBytes, bytesToHex } from '../utils/crypto.js';
+import { signDownloadTicket, verifyDownloadTicket } from '../auth/ticket.js';
+import { routeFeatureApi, isMaintenanceEnabled, isFeatureEnabled } from './features.js';
+import { recordAudit } from '../services/d1-logger.js';
+
+const VND = new Intl.NumberFormat('vi-VN');
+
+async function authenticate(request, env) {
+  const { value } = await readJson(request);
+  const telegramUser = await validateTelegramInitData(value.initData, env.BOT_TOKEN, Number(env.MAX_INIT_DATA_AGE_SECONDS || 86400));
+  const now = nowSeconds();
+  await env.DB.prepare(`INSERT INTO users (telegram_id, username, first_name, last_name, language_code, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(telegram_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name,
+      last_name=excluded.last_name, language_code=excluded.language_code, updated_at=excluded.updated_at`)
+    .bind(telegramUser.id, telegramUser.username || null, telegramUser.first_name || '', telegramUser.last_name || '', telegramUser.language_code || null, now, now).run();
+  const dbUser = await env.DB.prepare('SELECT id, telegram_id, username, first_name, last_name, balance_vnd, total_spent_vnd, vip_level, is_banned FROM users WHERE telegram_id = ?').bind(telegramUser.id).first();
+  if (!dbUser || dbUser.is_banned) throw new HttpError(403, 'Account is blocked', 'ACCOUNT_BLOCKED');
+  const initParams = new URLSearchParams(String(value.initData || ''));
+  const startParam = initParams.get('start_param') || '';
+  const referralMatch = startParam.match(/^ref_(\d{1,24})$/);
+  if (referralMatch && referralMatch[1] !== String(telegramUser.id)) {
+    const referrer = await env.DB.prepare('SELECT id FROM users WHERE telegram_id=?').bind(referralMatch[1]).first();
+    if (referrer) {
+      const reward = Math.max(0, Math.min(Number(env.REFERRAL_REWARD_VND || 2000), 1000000));
+      const nowReferral = nowSeconds();
+      await env.DB.batch([
+        env.DB.prepare('INSERT OR IGNORE INTO referrals(referrer_user_id,referred_user_id,reward_vnd,created_at) VALUES(?,?,?,?)').bind(referrer.id, dbUser.id, reward, nowReferral),
+        env.DB.prepare('UPDATE users SET balance_vnd=balance_vnd+? WHERE id=? AND changes()=1').bind(reward, referrer.id),
+        env.DB.prepare('UPDATE referrals SET rewarded_at=? WHERE referrer_user_id=? AND referred_user_id=? AND rewarded_at IS NULL AND changes()=1').bind(nowReferral, referrer.id, dbUser.id),
+        env.DB.prepare("INSERT OR IGNORE INTO wallet_transactions(user_id,kind,amount_vnd,reference,note,created_at) SELECT ?, 'referral', ?, ?, 'Thưởng giới thiệu bạn mới', ? WHERE EXISTS(SELECT 1 FROM referrals WHERE referrer_user_id=? AND referred_user_id=? AND rewarded_at=?)").bind(referrer.id, reward, `REFERRAL:${referrer.id}:${dbUser.id}`, nowReferral, referrer.id, dbUser.id, nowReferral),
+      ]);
+    }
+  }
+  const ttl = Math.min(Math.max(Number(env.SESSION_TTL_SECONDS || 3600), 300), 86400);
+  const token = await signSession({ telegramId: telegramUser.id }, env.SESSION_SECRET, ttl);
+  return json({ token, expiresIn: ttl, user: { ...dbUser, isAdmin: isAdmin(dbUser.telegram_id, env) } });
+}
+
+async function listProducts(env) {
+  const { results } = await env.DB.prepare(`SELECT p.id, p.title, p.description, p.category, p.price_vnd, p.kind,
+    (SELECT COUNT(*) FROM code_inventory ci WHERE ci.product_id=p.id AND ci.sold_at IS NULL AND ci.order_id IS NULL) AS stock
+    FROM products p WHERE p.is_active=1 ORDER BY p.category, p.created_at DESC`).all();
+  return json({ products: results });
+}
+
+async function getMe(request, env) {
+  const { user } = await requireSession(request, env);
+  return json({ user: { ...user, isAdmin: isAdmin(user.telegram_id, env) } });
+}
+
+async function getVip(request, env) {
+  const { user } = await requireSession(request, env);
+  const levels = [
+    { id: 'bronze', label: 'Đồng', minSpendVnd: 0, nextSpendVnd: 500000 },
+    { id: 'silver', label: 'Bạc', minSpendVnd: 500000, nextSpendVnd: 2000000 },
+    { id: 'gold', label: 'Vàng', minSpendVnd: 2000000, nextSpendVnd: 5000000 },
+    { id: 'platinum', label: 'Bạch kim', minSpendVnd: 5000000, nextSpendVnd: null },
+  ];
+  const level = levels.find((item) => item.id === user.vip_level) || levels[0];
+  const next = level.nextSpendVnd;
+  return json({ level, totalSpentVnd: user.total_spent_vnd || 0, nextLevel: next === null ? null : levels[levels.indexOf(level) + 1],
+    remainingVnd: next === null ? 0 : Math.max(0, next - (user.total_spent_vnd || 0)), levels });
+}
+
+async function getWallet(request, env) {
+  const { user } = await requireSession(request, env);
+  const { results } = await env.DB.prepare('SELECT id, kind, amount_vnd, reference, note, created_at FROM wallet_transactions WHERE user_id=? ORDER BY created_at DESC LIMIT 50').bind(user.id).all();
+  return json({ balanceVnd: user.balance_vnd, transactions: results });
+}
+
+async function getOrders(request, env) {
+  const { user } = await requireSession(request, env);
+  const { results } = await env.DB.prepare(`SELECT o.order_id, o.amount_vnd, o.status, o.created_at, o.completed_at, p.title
+    FROM orders o JOIN products p ON p.id=o.product_id WHERE o.user_id=? ORDER BY o.created_at DESC LIMIT 50`).bind(user.id).all();
+  return json({ orders: results });
+}
+
+async function buyProduct(request, env) {
+  const { user } = await requireSession(request, env);
+  const { value } = await readJson(request);
+  const productId = assertString(value.productId, 'productId', 80);
+  const idempotencyKey = assertString(value.requestId, 'requestId', 100);
+  const now = nowSeconds();
+  const orderId = crypto.randomUUID();
+
+  // The D1 batch is atomic. Price comes from D1; client-supplied amounts are ignored.
+  await env.DB.batch([
+    env.DB.prepare(`INSERT OR IGNORE INTO orders(order_id,user_id,product_id,idempotency_key,amount_vnd,status,created_at)
+      SELECT ?, u.id, p.id, ?, p.price_vnd, 'pending', ? FROM users u JOIN products p ON p.id=?
+      WHERE u.id=? AND u.is_banned=0 AND p.is_active=1 AND u.balance_vnd>=p.price_vnd
+        AND EXISTS(SELECT 1 FROM code_inventory ci WHERE ci.product_id=p.id AND ci.sold_at IS NULL AND ci.order_id IS NULL)`)
+      .bind(orderId, idempotencyKey, now, productId, user.id),
+    env.DB.prepare(`UPDATE code_inventory SET order_id=? WHERE id=(SELECT ci.id FROM code_inventory ci JOIN orders o ON o.order_id=?
+      WHERE ci.product_id=? AND ci.sold_at IS NULL AND ci.order_id IS NULL AND o.status='pending' ORDER BY ci.id LIMIT 1)
+      AND EXISTS(SELECT 1 FROM orders WHERE order_id=? AND status='pending')`)
+      .bind(orderId, orderId, productId, orderId),
+    env.DB.prepare(`UPDATE users SET balance_vnd=balance_vnd-(SELECT amount_vnd FROM orders WHERE order_id=?)
+      WHERE id=? AND balance_vnd >= (SELECT amount_vnd FROM orders WHERE order_id=?)
+      AND EXISTS(SELECT 1 FROM code_inventory WHERE order_id=? AND sold_at IS NULL)`)
+      .bind(orderId, user.id, orderId, orderId),
+    env.DB.prepare(`UPDATE users SET total_spent_vnd=total_spent_vnd+(SELECT amount_vnd FROM orders WHERE order_id=?),
+      vip_level=CASE WHEN total_spent_vnd+(SELECT amount_vnd FROM orders WHERE order_id=?)>=5000000 THEN 'platinum'
+        WHEN total_spent_vnd+(SELECT amount_vnd FROM orders WHERE order_id=?)>=2000000 THEN 'gold'
+        WHEN total_spent_vnd+(SELECT amount_vnd FROM orders WHERE order_id=?)>=500000 THEN 'silver' ELSE 'bronze' END
+      WHERE id=? AND changes()=1`).bind(orderId, orderId, orderId, orderId, user.id),
+    env.DB.prepare('UPDATE code_inventory SET sold_at=? WHERE order_id=? AND sold_at IS NULL AND changes()=1').bind(now, orderId),
+    env.DB.prepare('UPDATE code_inventory SET order_id=NULL WHERE order_id=? AND sold_at IS NULL AND changes()=0').bind(orderId),
+    env.DB.prepare(`UPDATE orders SET status='completed', completed_at=? WHERE order_id=? AND status='pending'
+      AND EXISTS(SELECT 1 FROM code_inventory WHERE order_id=? AND sold_at=?)`).bind(now, orderId, orderId, now),
+    env.DB.prepare(`INSERT OR IGNORE INTO wallet_transactions(user_id,kind,amount_vnd,reference,note,created_at)
+      SELECT user_id,'purchase',-amount_vnd,order_id,'Mua sản phẩm: ' || product_id,? FROM orders WHERE order_id=? AND status='completed'`)
+      .bind(now, orderId),
+  ]);
+
+  const order = await env.DB.prepare(`SELECT o.order_id,o.amount_vnd,o.status,o.created_at,p.title,
+    ci.secret_value AS delivery FROM orders o JOIN products p ON p.id=o.product_id
+    LEFT JOIN code_inventory ci ON ci.order_id=o.order_id WHERE o.user_id=? AND o.idempotency_key=?`)
+    .bind(user.id, idempotencyKey).first();
+  if (!order) throw new HttpError(409, 'Không đủ số dư hoặc sản phẩm đã hết hàng', 'PURCHASE_UNAVAILABLE');
+  if (order.status !== 'completed' || !order.delivery) {
+    throw new HttpError(409, 'Không thể hoàn tất đơn hàng. Số dư chưa bị trừ nếu đơn không hoàn tất; hãy tải lại và thử lại.', 'PURCHASE_NOT_COMPLETED');
+  }
+  return json({ order: { orderId: order.order_id, title: order.title, amountVnd: order.amount_vnd, createdAt: order.created_at }, delivery: order.delivery, message: 'Mua hàng thành công' });
+}
+
+async function createDeposit(request, env) {
+  const { user } = await requireSession(request, env);
+  const { value } = await readJson(request);
+  const amount = Number(value.amountVnd);
+  const min = Number(env.MIN_DEPOSIT_VND || 10000); const max = Number(env.MAX_DEPOSIT_VND || 100000000);
+  if (!Number.isSafeInteger(amount) || amount < min || amount > max) throw new HttpError(400, `Số tiền phải từ ${VND.format(min)} đến ${VND.format(max)} VNĐ`, 'INVALID_AMOUNT');
+  const now = nowSeconds();
+  const depositId = crypto.randomUUID();
+  const reference = `HENDY${String(user.telegram_id).slice(-6)}${crypto.randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase()}`;
+  await env.DB.prepare('INSERT INTO deposit_requests(id,user_id,reference,amount_vnd,status,created_at,updated_at) VALUES(?,?,?,? ,\'pending\',?,?)')
+    .bind(depositId, user.id, reference, amount, now, now).run();
+  let qrUrl = null;
+  if (env.BANK_ID && env.BANK_ACCOUNT_NUMBER) {
+    const params = new URLSearchParams({ amount: String(amount), addInfo: reference });
+    if (env.BANK_ACCOUNT_NAME) params.set('accountName', env.BANK_ACCOUNT_NAME);
+    qrUrl = `https://img.vietqr.io/image/${encodeURIComponent(env.BANK_ID)}-${encodeURIComponent(env.BANK_ACCOUNT_NUMBER)}-compact2.png?${params}`;
+  }
+  return json({ deposit: { id: depositId, reference, amountVnd: amount, status: 'pending', qrUrl, createdAt: now } }, 201);
+}
+
+async function bankWebhook(request, env, rawBody) {
+  if (!env.BANK_WEBHOOK_SECRET) throw new HttpError(503, 'Bank webhook is not configured', 'WEBHOOK_NOT_CONFIGURED');
+  const signature = (request.headers.get('x-signature') || '').replace(/^sha256=/i, '').toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(signature)) throw new HttpError(401, 'Invalid webhook signature', 'INVALID_SIGNATURE');
+  const expected = bytesToHex(await hmacBytes(env.BANK_WEBHOOK_SECRET, rawBody));
+  if (!safeEqual(signature, expected)) {
+    throw new HttpError(401, 'Invalid webhook signature', 'INVALID_SIGNATURE');
+  }
+  let event;
+  try { event = JSON.parse(rawBody); } catch { throw new HttpError(400, 'Invalid webhook JSON', 'INVALID_JSON'); }
+  const transactionId = assertString(String(event.transactionId || ''), 'transactionId', 160);
+  const reference = assertString(String(event.reference || ''), 'reference', 100);
+  const amount = Number(event.amount);
+  if (event.direction !== 'credit' || !Number.isSafeInteger(amount) || amount <= 0) return json({ ok: true, ignored: true });
+  const digest = bytesToHex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(rawBody)));
+  const now = nowSeconds();
+  const result = await env.DB.batch([
+    env.DB.prepare(`UPDATE users SET balance_vnd=balance_vnd+(SELECT amount_vnd FROM deposit_requests WHERE reference=? AND status='pending' AND amount_vnd=?), updated_at=?
+      WHERE id=(SELECT user_id FROM deposit_requests WHERE reference=? AND status='pending' AND amount_vnd=?)
+      AND EXISTS(SELECT 1 FROM deposit_requests WHERE reference=? AND status='pending' AND amount_vnd=?)`)
+      .bind(reference, amount, now, reference, amount, reference, amount),
+    env.DB.prepare(`UPDATE deposit_requests SET status='credited',provider_tx_id=?,updated_at=? WHERE reference=? AND status='pending' AND amount_vnd=? AND changes()=1`)
+      .bind(transactionId, now, reference, amount),
+    env.DB.prepare(`INSERT OR IGNORE INTO bank_webhook_events(provider_tx_id,reference,raw_event_hash,received_at)
+      SELECT ?,?,?,? WHERE EXISTS(SELECT 1 FROM deposit_requests WHERE reference=? AND status='credited' AND provider_tx_id=?)`)
+      .bind(transactionId, reference, digest, now, reference, transactionId),
+    env.DB.prepare(`INSERT OR IGNORE INTO wallet_transactions(user_id,kind,amount_vnd,reference,note,created_at)
+      SELECT user_id,'deposit',amount_vnd,provider_tx_id,'Nạp tiền ngân hàng',? FROM deposit_requests WHERE reference=? AND status='credited' AND provider_tx_id=?`)
+      .bind(now, reference, transactionId),
+  ]);
+  const deposit = await env.DB.prepare('SELECT status,amount_vnd,provider_tx_id FROM deposit_requests WHERE reference=?').bind(reference).first();
+  if (!deposit || deposit.amount_vnd !== amount) return json({ ok: true, ignored: true });
+  if (deposit.provider_tx_id === transactionId && deposit.status === 'credited') return json({ ok: true, credited: true, duplicateSafe: true });
+  return json({ ok: true, credited: false, ignored: true });
+}
+
+async function redeemGiftcode(request, env) {
+  const { user } = await requireSession(request, env);
+  const { value } = await readJson(request);
+  const code = assertString(String(value.code || '').toUpperCase(), 'code', 80);
+  const now = nowSeconds();
+  const gift = await env.DB.prepare('SELECT id,amount_vnd FROM giftcodes WHERE code=? COLLATE NOCASE AND is_active=1 AND used_count<max_uses AND (expires_at IS NULL OR expires_at>?)').bind(code, now).first();
+  if (!gift) throw new HttpError(404, 'Gifcode không hợp lệ, đã hết lượt hoặc hết hạn', 'GIFTCODE_INVALID');
+  const alreadyRedeemed = await env.DB.prepare('SELECT 1 AS yes FROM giftcode_redemptions WHERE giftcode_id=? AND user_id=?').bind(gift.id, user.id).first();
+  if (alreadyRedeemed) throw new HttpError(409, 'Gifcode này đã được tài khoản sử dụng', 'GIFTCODE_USED');
+  await env.DB.batch([
+    env.DB.prepare(`INSERT OR IGNORE INTO giftcode_redemptions(giftcode_id,user_id,redeemed_at)
+      SELECT id,?,? FROM giftcodes WHERE id=? AND is_active=1 AND used_count<max_uses AND (expires_at IS NULL OR expires_at>?)`)
+      .bind(user.id, now, gift.id, now),
+    env.DB.prepare('UPDATE giftcodes SET used_count=used_count+1 WHERE id=? AND changes()=1 AND used_count<max_uses').bind(gift.id),
+    env.DB.prepare('UPDATE users SET balance_vnd=balance_vnd+(SELECT amount_vnd FROM giftcodes WHERE id=?) WHERE id=? AND changes()=1').bind(gift.id, user.id),
+    env.DB.prepare(`INSERT OR IGNORE INTO wallet_transactions(user_id,kind,amount_vnd,reference,note,created_at)
+      SELECT ?, 'giftcode', amount_vnd, 'GIFT:' || ? || ':' || ?, 'Đổi gifcode', ? FROM giftcodes WHERE id=? AND EXISTS(SELECT 1 FROM giftcode_redemptions WHERE giftcode_id=? AND user_id=?)`)
+      .bind(user.id, gift.id, user.id, now, gift.id, gift.id, user.id),
+  ]);
+  const redeemed = await env.DB.prepare('SELECT 1 AS ok FROM giftcode_redemptions WHERE giftcode_id=? AND user_id=?').bind(gift.id, user.id).first();
+  const ledger = await env.DB.prepare('SELECT 1 AS ok FROM wallet_transactions WHERE user_id=? AND reference=?').bind(user.id, `GIFT:${gift.id}:${user.id}`).first();
+  if (!redeemed || !ledger) throw new HttpError(409, 'Gifcode đã được sử dụng hoặc hết lượt', 'GIFTCODE_USED');
+  const updated = await env.DB.prepare('SELECT balance_vnd FROM users WHERE id=?').bind(user.id).first();
+  return json({ ok: true, amountVnd: gift.amount_vnd, balanceVnd: updated.balance_vnd });
+}
+
+async function adminOverview(request, env) {
+  await requireAdmin(request, env);
+  const [users, products, orders, deposits] = await Promise.all([
+    env.DB.prepare('SELECT COUNT(*) AS count FROM users').first(),
+    env.DB.prepare('SELECT COUNT(*) AS count FROM products').first(),
+    env.DB.prepare("SELECT COUNT(*) AS count FROM orders WHERE status='completed'").first(),
+    env.DB.prepare("SELECT COUNT(*) AS count FROM deposit_requests WHERE status='pending'").first(),
+  ]);
+  return json({ stats: { users: users.count, products: products.count, completedOrders: orders.count, pendingDeposits: deposits.count } });
+}
+
+async function adminProducts(request, env) {
+  await requireAdmin(request, env);
+  if (request.method === 'GET') {
+    const { results } = await env.DB.prepare(`SELECT p.*, (SELECT COUNT(*) FROM code_inventory ci WHERE ci.product_id=p.id AND ci.sold_at IS NULL AND ci.order_id IS NULL) AS stock
+      FROM products p ORDER BY p.created_at DESC`).all();
+    return json({ products: results });
+  }
+  const { user } = await requireAdmin(request, env);
+  const { value } = await readJson(request);
+  const id = typeof value.id === 'string' && value.id.trim() ? value.id.trim().slice(0,80) : crypto.randomUUID();
+  const title = assertString(value.title, 'title', 160);
+  const category = typeof value.category === 'string' ? value.category.trim().slice(0,80) || 'Khác' : 'Khác';
+  const description = typeof value.description === 'string' ? value.description.slice(0,2000) : '';
+  const price = Number(value.priceVnd);
+  if (!Number.isSafeInteger(price) || price < 0 || price > 1000000000) throw new HttpError(400, 'Invalid priceVnd', 'INVALID_AMOUNT');
+  const kind = value.kind === 'link' ? 'link' : 'code';
+  const active = value.isActive === false ? 0 : 1;
+  const now = nowSeconds();
+  await env.DB.prepare(`INSERT INTO products(id,title,description,category,price_vnd,kind,is_active,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,description=excluded.description,category=excluded.category,
+    price_vnd=excluded.price_vnd,kind=excluded.kind,is_active=excluded.is_active,updated_at=excluded.updated_at`)
+    .bind(id, title, description, category, price, kind, active, now, now).run();
+  await recordAudit(env, user.telegram_id, 'product.upsert', 'product', id, { title, priceVnd: price, kind });
+  return json({ ok: true, id }, 201);
+}
+
+async function adminStock(request, env) {
+  const { user } = await requireAdmin(request, env);
+  const { value } = await readJson(request, 256 * 1024);
+  const productId = assertString(value.productId, 'productId', 80);
+  if (!Array.isArray(value.codes) || value.codes.length < 1 || value.codes.length > 500) throw new HttpError(400, 'codes must contain 1–500 entries', 'INVALID_CODES');
+  const product = await env.DB.prepare('SELECT id FROM products WHERE id=?').bind(productId).first();
+  if (!product) throw new HttpError(404, 'Product not found', 'PRODUCT_NOT_FOUND');
+  const now = nowSeconds();
+  const values = value.codes.map((code) => {
+    if (typeof code !== 'string' || !code.trim() || code.length > 4000) throw new HttpError(400, 'Each inventory code must be a non-empty string no longer than 4000 characters', 'INVALID_CODES');
+    return env.DB.prepare('INSERT INTO code_inventory(product_id,secret_value,created_at) VALUES(?,?,?)').bind(productId, code.trim(), now);
+  });
+  for (let i = 0; i < values.length; i += 50) await env.DB.batch(values.slice(i, i + 50));
+  await recordAudit(env, user.telegram_id, 'inventory.import', 'product', productId, { count: values.length });
+  return json({ ok: true, imported: values.length }, 201);
+}
+
+async function adminGiftcode(request, env) {
+  const { user } = await requireAdmin(request, env);
+  const { value } = await readJson(request);
+  const code = assertString(String(value.code || '').toUpperCase(), 'code', 80);
+  const amount = Number(value.amountVnd); const maxUses = Number(value.maxUses || 1);
+  if (!Number.isSafeInteger(amount) || amount <= 0 || amount > 1000000000 || !Number.isSafeInteger(maxUses) || maxUses < 1 || maxUses > 100000) {
+    throw new HttpError(400, 'Invalid amountVnd or maxUses', 'INVALID_GIFTCODE');
+  }
+  const id = crypto.randomUUID(); const now = nowSeconds();
+  await env.DB.prepare('INSERT INTO giftcodes(id,code,amount_vnd,max_uses,expires_at,is_active,created_at) VALUES(?,?,?,?,?,1,?)')
+    .bind(id, code, amount, maxUses, Number.isSafeInteger(Number(value.expiresAt)) ? Number(value.expiresAt) : null, now).run();
+  await recordAudit(env, user.telegram_id, 'giftcode.create', 'giftcode', id, { amountVnd: amount, maxUses });
+  return json({ ok: true, id, code }, 201);
+}
+
+async function adminUsers(request, env) {
+  await requireAdmin(request, env);
+  const { results } = await env.DB.prepare('SELECT telegram_id,username,first_name,last_name,balance_vnd,total_spent_vnd,vip_level,is_banned,created_at FROM users ORDER BY created_at DESC LIMIT 100').all();
+  return json({ users: results });
+}
+
+async function releases(request, env, platform) {
+  const subject = request.headers.get('cf-connecting-ip') || 'public-release-list';
+  if (!await isFeatureEnabled(env, 'app_releases', subject)) return json({ releases: [] });
+  const valid = ['android','ios','windows','macos'];
+  if (platform && !valid.includes(platform)) throw new HttpError(400, 'Invalid platform', 'INVALID_PLATFORM');
+  const stmt = platform
+    ? env.DB.prepare('SELECT id,platform,version,build_number,file_name,size_bytes,sha256,notes,created_at FROM app_releases WHERE platform=? AND is_active=1 ORDER BY created_at DESC LIMIT 1').bind(platform)
+    : env.DB.prepare('SELECT id,platform,version,build_number,file_name,size_bytes,sha256,notes,created_at FROM app_releases WHERE is_active=1 ORDER BY created_at DESC');
+  const result = platform ? await stmt.first() : (await stmt.all()).results;
+  return json({ releases: result });
+}
+
+
+const RELEASE_PART_SIZE = 8 * 1024 * 1024;
+const MAX_RELEASE_SIZE = 2 * 1024 * 1024 * 1024;
+
+function releaseContentType(fileName) {
+  const extension = fileName.slice(fileName.lastIndexOf('.')).toLowerCase();
+  return ({
+    '.apk': 'application/vnd.android.package-archive',
+    '.aab': 'application/octet-stream',
+    '.ipa': 'application/octet-stream',
+    '.exe': 'application/vnd.microsoft.portable-executable',
+    '.msix': 'application/msix',
+    '.dmg': 'application/x-apple-diskimage',
+    '.pkg': 'application/octet-stream',
+  })[extension] || 'application/octet-stream';
+}
+
+function validateReleaseFile(platform, fileName) {
+  const extensions = { android: ['.apk', '.aab'], ios: ['.ipa'], windows: ['.exe', '.msix'], macos: ['.dmg', '.pkg'] };
+  const extension = fileName.slice(fileName.lastIndexOf('.')).toLowerCase();
+  if (!extensions[platform]?.includes(extension)) throw new HttpError(400, `File extension not allowed for ${platform}`, 'INVALID_FILE_TYPE');
+}
+
+async function adminReleases(request, env) {
+  const { user } = await requireAdmin(request, env);
+  if (request.method === 'GET') {
+    const { results } = await env.DB.prepare(`SELECT id,platform,version,build_number,file_name,content_type,size_bytes,sha256,notes,is_active,created_at
+      FROM app_releases ORDER BY created_at DESC LIMIT 100`).all();
+    return json({ releases: results });
+  }
+  if (!env.ARTIFACTS) throw new HttpError(503, 'R2 ARTIFACTS binding is not configured', 'R2_NOT_CONFIGURED');
+  const { value } = await readJson(request);
+  const platform = String(value.platform || '');
+  const version = String(value.version || '').trim();
+  const buildNumber = Number(value.buildNumber || 1);
+  const notes = typeof value.notes === 'string' ? value.notes.slice(0, 4000) : '';
+  const sizeBytes = Number(value.sizeBytes);
+  const originalName = assertString(value.fileName, 'fileName', 240).split(/[\\/]/).pop();
+  const fileName = originalName.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 180) || 'artifact.bin';
+  if (!['android','ios','windows','macos'].includes(platform)) throw new HttpError(400, 'Invalid platform', 'INVALID_PLATFORM');
+  if (!/^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$/.test(version)) throw new HttpError(400, 'Invalid version string', 'INVALID_VERSION');
+  if (!Number.isSafeInteger(buildNumber) || buildNumber < 1) throw new HttpError(400, 'Invalid build number', 'INVALID_BUILD');
+  if (!Number.isSafeInteger(sizeBytes) || sizeBytes <= 0 || sizeBytes > MAX_RELEASE_SIZE) throw new HttpError(400, 'File size must be between 1 byte and 2 GiB', 'INVALID_FILE_SIZE');
+  validateReleaseFile(platform, fileName);
+  const duplicate = await env.DB.prepare('SELECT id FROM app_releases WHERE platform=? AND version=?').bind(platform, version).first();
+  if (duplicate) throw new HttpError(409, 'A release with this platform/version already exists', 'RELEASE_VERSION_EXISTS');
+  const id = crypto.randomUUID(); const now = nowSeconds();
+  const key = `releases/${platform}/${version}/${id}-${fileName}`;
+  const contentType = releaseContentType(fileName);
+  const multipart = await env.ARTIFACTS.createMultipartUpload(key, { httpMetadata: { contentType }, customMetadata: { platform, version, buildNumber: String(buildNumber) } });
+  try {
+    await env.DB.prepare(`INSERT INTO release_uploads(id,r2_key,r2_upload_id,platform,version,build_number,file_name,content_type,size_bytes,notes,admin_telegram_id,status,created_at,expires_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,'uploading',?,?)`)
+      .bind(id, key, multipart.uploadId, platform, version, buildNumber, fileName, contentType, sizeBytes, notes, user.telegram_id, now, now + 3600).run();
+  } catch (error) {
+    await multipart.abort().catch(() => {});
+    throw error;
+  }
+  await recordAudit(env, user.telegram_id, 'release.upload_start', 'release_upload', id, { platform, version, sizeBytes });
+  return json({ uploadSessionId: id, partSizeBytes: RELEASE_PART_SIZE, totalParts: Math.ceil(sizeBytes / RELEASE_PART_SIZE), expiresInSeconds: 3600 }, 201);
+}
+
+async function uploadReleasePart(request, env, sessionId, partNumber) {
+  const { user } = await requireAdmin(request, env);
+  const session = await env.DB.prepare('SELECT * FROM release_uploads WHERE id=?').bind(sessionId).first();
+  if (!session || session.admin_telegram_id !== user.telegram_id) throw new HttpError(404, 'Upload session not found', 'UPLOAD_NOT_FOUND');
+  if (session.status !== 'uploading' || session.expires_at <= nowSeconds()) throw new HttpError(409, 'Upload session expired or closed', 'UPLOAD_CLOSED');
+  const totalParts = Math.ceil(session.size_bytes / RELEASE_PART_SIZE);
+  if (!Number.isSafeInteger(partNumber) || partNumber < 1 || partNumber > totalParts) throw new HttpError(400, 'Invalid part number', 'INVALID_PART_NUMBER');
+  const expectedSize = partNumber < totalParts ? RELEASE_PART_SIZE : session.size_bytes - RELEASE_PART_SIZE * (totalParts - 1);
+  const declaredLength = Number(request.headers.get('content-length') || 0);
+  if (declaredLength && declaredLength !== expectedSize) throw new HttpError(400, 'Chunk size does not match the expected part size', 'INVALID_PART_SIZE');
+  if (!request.body) throw new HttpError(400, 'Upload part body is empty', 'EMPTY_PART');
+  const bytes = await request.arrayBuffer();
+  if (bytes.byteLength !== expectedSize) throw new HttpError(400, 'Chunk size does not match the expected part size', 'INVALID_PART_SIZE');
+  const upload = env.ARTIFACTS.resumeMultipartUpload(session.r2_key, session.r2_upload_id);
+  let result;
+  try { result = await upload.uploadPart(partNumber, bytes); }
+  catch { throw new HttpError(400, 'R2 rejected this upload part; retry the part', 'PART_UPLOAD_FAILED'); }
+  await env.DB.prepare(`INSERT INTO release_upload_parts(upload_session_id,part_number,etag,size_bytes,created_at) VALUES(?,?,?,?,?)
+    ON CONFLICT(upload_session_id,part_number) DO UPDATE SET etag=excluded.etag,size_bytes=excluded.size_bytes,created_at=excluded.created_at`)
+    .bind(sessionId, partNumber, result.etag, bytes.byteLength, nowSeconds()).run();
+  return json({ partNumber, etag: result.etag, sizeBytes: bytes.byteLength });
+}
+
+async function completeReleaseUpload(request, env, sessionId) {
+  const { user } = await requireAdmin(request, env);
+  const session = await env.DB.prepare('SELECT * FROM release_uploads WHERE id=?').bind(sessionId).first();
+  if (!session || session.admin_telegram_id !== user.telegram_id) throw new HttpError(404, 'Upload session not found', 'UPLOAD_NOT_FOUND');
+  if (session.status === 'completed' && session.release_id) return json({ ok: true, releaseId: session.release_id, duplicateSafe: true });
+  if (session.status !== 'uploading' || session.expires_at <= nowSeconds()) throw new HttpError(409, 'Upload session expired or closed', 'UPLOAD_CLOSED');
+  const { results: rows } = await env.DB.prepare('SELECT part_number,etag,size_bytes FROM release_upload_parts WHERE upload_session_id=? ORDER BY part_number').bind(sessionId).all();
+  const totalParts = Math.ceil(session.size_bytes / RELEASE_PART_SIZE);
+  if (rows.length !== totalParts || rows.some((part, index) => part.part_number !== index + 1)) throw new HttpError(409, 'Some upload parts are missing; upload them before completing', 'PARTS_INCOMPLETE');
+  if (rows.reduce((sum, part) => sum + part.size_bytes, 0) !== session.size_bytes) throw new HttpError(409, 'Uploaded size does not match the declared size', 'UPLOAD_SIZE_MISMATCH');
+  const upload = env.ARTIFACTS.resumeMultipartUpload(session.r2_key, session.r2_upload_id);
+  let object;
+  try { object = await upload.complete(rows.map((part) => ({ partNumber: part.part_number, etag: part.etag }))); }
+  catch { throw new HttpError(400, 'R2 could not complete this release upload', 'UPLOAD_COMPLETION_FAILED'); }
+  const releaseId = crypto.randomUUID(); const now = nowSeconds();
+  try {
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO app_releases(id,platform,version,build_number,r2_key,sha256,notes,is_active,created_at,file_name,content_type,size_bytes)
+        VALUES(?,?,?,?,?,NULL,?,0,?,?,?,?)`)
+        .bind(releaseId, session.platform, session.version, session.build_number, session.r2_key, session.notes, now, session.file_name, session.content_type, session.size_bytes),
+      env.DB.prepare("UPDATE release_uploads SET status='completed',release_id=? WHERE id=? AND status='uploading'").bind(releaseId, sessionId),
+      env.DB.prepare('INSERT INTO audit_logs(actor_telegram_id,action,target_type,target_id,details_json,created_at) VALUES(?,?,?,?,?,?)')
+        .bind(user.telegram_id, 'release.upload_complete', 'release', releaseId, JSON.stringify({ platform: session.platform, version: session.version, sizeBytes: session.size_bytes, etag: object.httpEtag }), now),
+    ]);
+  } catch (error) {
+    await env.ARTIFACTS.delete(session.r2_key).catch(() => {});
+    await env.DB.prepare("UPDATE release_uploads SET status='aborted' WHERE id=?").bind(sessionId).run().catch(() => {});
+    throw error;
+  }
+  return json({ ok: true, release: { id: releaseId, platform: session.platform, version: session.version, buildNumber: session.build_number, fileName: session.file_name, sizeBytes: session.size_bytes, active: false } }, 201);
+}
+
+async function abortReleaseUpload(request, env, sessionId) {
+  const { user } = await requireAdmin(request, env);
+  const session = await env.DB.prepare('SELECT * FROM release_uploads WHERE id=?').bind(sessionId).first();
+  if (!session || session.admin_telegram_id !== user.telegram_id) throw new HttpError(404, 'Upload session not found', 'UPLOAD_NOT_FOUND');
+  if (session.status === 'completed') throw new HttpError(409, 'Completed upload cannot be aborted', 'UPLOAD_CLOSED');
+  if (session.status === 'uploading') {
+    try { await env.ARTIFACTS.resumeMultipartUpload(session.r2_key, session.r2_upload_id).abort(); }
+    catch { throw new HttpError(503, 'Could not abort the R2 upload; the cleanup job will retry', 'UPLOAD_ABORT_FAILED'); }
+    await env.DB.batch([
+      env.DB.prepare("UPDATE release_uploads SET status='aborted' WHERE id=? AND status='uploading'").bind(sessionId),
+      env.DB.prepare('DELETE FROM release_upload_parts WHERE upload_session_id=?').bind(sessionId),
+    ]);
+  }
+  return json({ ok: true });
+}
+
+async function activateRelease(request, env, releaseId) {
+  const { user } = await requireAdmin(request, env);
+  const release = await env.DB.prepare('SELECT id,platform,version FROM app_releases WHERE id=?').bind(releaseId).first();
+  if (!release) throw new HttpError(404, 'Release not found', 'RELEASE_NOT_FOUND');
+  await env.DB.batch([
+    env.DB.prepare('UPDATE app_releases SET is_active=0 WHERE platform=?').bind(release.platform),
+    env.DB.prepare('UPDATE app_releases SET is_active=1 WHERE id=?').bind(releaseId),
+    env.DB.prepare('INSERT INTO audit_logs(actor_telegram_id,action,target_type,target_id,details_json,created_at) VALUES(?,?,?,?,?,?)')
+      .bind(user.telegram_id, 'release.activate', 'release', releaseId, JSON.stringify({ platform: release.platform, version: release.version }), nowSeconds()),
+  ]);
+  return json({ ok: true, releaseId, platform: release.platform, version: release.version });
+}
+
+async function downloadTicket(request, env, platform) {
+  const subject = request.headers.get('cf-connecting-ip') || 'public-release-download';
+  if (!await isFeatureEnabled(env, 'app_releases', subject)) throw new HttpError(404, 'App releases are temporarily disabled', 'FEATURE_DISABLED');
+  if (!['android','ios','windows','macos'].includes(platform)) throw new HttpError(400, 'Invalid platform', 'INVALID_PLATFORM');
+  const release = await env.DB.prepare(`SELECT id,platform,version,build_number,file_name,size_bytes,sha256,notes,created_at
+    FROM app_releases WHERE platform=? AND is_active=1 ORDER BY created_at DESC LIMIT 1`).bind(platform).first();
+  if (!release) throw new HttpError(404, 'No active release for this platform', 'RELEASE_NOT_FOUND');
+  const ticket = await signDownloadTicket(release.id, env.SESSION_SECRET, 300);
+  const downloadUrl = new URL(`/downloads/${encodeURIComponent(release.id)}?ticket=${encodeURIComponent(ticket)}`, request.url).toString();
+  return json({ release, downloadUrl, ticketExpiresIn: 300 });
+}
+
+export async function handleBinaryDownload(request, env, url) {
+  if (request.method !== 'GET' && request.method !== 'HEAD') throw new HttpError(405, 'Method not allowed', 'METHOD_NOT_ALLOWED');
+  const releaseId = url.pathname.split('/')[2];
+  if (!releaseId || !env.ARTIFACTS) throw new HttpError(404, 'Release not found', 'RELEASE_NOT_FOUND');
+  await verifyDownloadTicket(url.searchParams.get('ticket') || '', releaseId, env.SESSION_SECRET);
+  const release = await env.DB.prepare('SELECT r2_key,file_name,content_type,size_bytes FROM app_releases WHERE id=? AND is_active=1').bind(releaseId).first();
+  if (!release) throw new HttpError(404, 'Release not found or no longer active', 'RELEASE_NOT_FOUND');
+  const object = await env.ARTIFACTS.get(release.r2_key);
+  if (!object) throw new HttpError(404, 'Binary is missing from storage', 'BINARY_NOT_FOUND');
+  const safeName = String(release.file_name || 'download.bin').replace(/[\r\n"\\]/g, '_');
+  const headers = new Headers({
+    'content-type': release.content_type || 'application/octet-stream',
+    'content-disposition': `attachment; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`,
+    'cache-control': 'private, no-store, max-age=0',
+    'x-content-type-options': 'nosniff',
+    'content-length': String(release.size_bytes || object.size),
+  });
+  return new Response(request.method === 'HEAD' ? null : object.body, { status: 200, headers });
+}
+
+
+export async function routeApi(request, env, url) {
+  const path = url.pathname; const method = request.method.toUpperCase();
+  if (path.startsWith('/api/') && !path.startsWith('/api/admin/')) {
+    if (await isMaintenanceEnabled(env)) {
+      const row = await env.DB.prepare("SELECT value_json FROM bot_configs WHERE config_key='maintenance_message'").first();
+      let message = 'Hệ thống đang bảo trì.';
+      try { message = JSON.parse(row?.value_json || '""') || message; } catch { /* default */ }
+      throw new HttpError(503, String(message), 'MAINTENANCE_MODE');
+    }
+  }
+  const featureResponse = await routeFeatureApi(request, env, url);
+  if (featureResponse) return featureResponse;
+  if (path === '/api/auth/telegram' && method === 'POST') return authenticate(request, env);
+  if (path === '/api/products' && method === 'GET') return listProducts(env);
+  if (path === '/api/me' && method === 'GET') return getMe(request, env);
+  if (path === '/api/wallet' && method === 'GET') return getWallet(request, env);
+  if (path === '/api/vip' && method === 'GET') return getVip(request, env);
+  if (path === '/api/orders' && method === 'GET') return getOrders(request, env);
+  if (path === '/api/orders' && method === 'POST') return buyProduct(request, env);
+  if (path === '/api/deposits' && method === 'POST') return createDeposit(request, env);
+  if (path === '/api/giftcodes/redeem' && method === 'POST') return redeemGiftcode(request, env);
+  if (path === '/webhooks/bank' && method === 'POST') {
+    const { raw } = await readJson(request, 128 * 1024);
+    return bankWebhook(request, env, raw);
+  }
+  if (path === '/api/admin/overview' && method === 'GET') return adminOverview(request, env);
+  if (path === '/api/admin/products' && ['GET','POST'].includes(method)) return adminProducts(request, env);
+  if (path === '/api/admin/inventory' && method === 'POST') return adminStock(request, env);
+  if (path === '/api/admin/giftcodes' && method === 'POST') return adminGiftcode(request, env);
+  if (path === '/api/admin/releases' && ['GET','POST'].includes(method)) return adminReleases(request, env);
+  const partUpload = path.match(/^\/api\/admin\/releases\/uploads\/([a-zA-Z0-9-]+)\/parts\/(\d+)$/);
+  if (partUpload && method === 'PUT') return uploadReleasePart(request, env, partUpload[1], Number(partUpload[2]));
+  const uploadComplete = path.match(/^\/api\/admin\/releases\/uploads\/([a-zA-Z0-9-]+)\/complete$/);
+  if (uploadComplete && method === 'POST') return completeReleaseUpload(request, env, uploadComplete[1]);
+  const uploadAbort = path.match(/^\/api\/admin\/releases\/uploads\/([a-zA-Z0-9-]+)$/);
+  if (uploadAbort && method === 'DELETE') return abortReleaseUpload(request, env, uploadAbort[1]);
+  const activation = path.match(/^\/api\/admin\/releases\/([a-zA-Z0-9-]+)\/activate$/);
+  if (activation && method === 'POST') return activateRelease(request, env, activation[1]);
+  const ticketPath = path.match(/^\/api\/releases\/(android|ios|windows|macos)\/download-ticket$/);
+  if (ticketPath && method === 'GET') return downloadTicket(request, env, ticketPath[1]);
+  if (path === '/api/admin/users' && method === 'GET') return adminUsers(request, env);
+  if (path === '/api/releases' && method === 'GET') return releases(request, env, url.searchParams.get('platform'));
+  if (path === '/api/admin/audit' && method === 'GET') {
+    await requireAdmin(request, env);
+    const { results } = await env.DB.prepare('SELECT id,actor_telegram_id,action,target_type,target_id,details_json,created_at FROM audit_logs ORDER BY created_at DESC LIMIT 100').all();
+    return json({ logs: results });
+  }
+  throw new HttpError(404, 'Route not found', 'NOT_FOUND');
+}
