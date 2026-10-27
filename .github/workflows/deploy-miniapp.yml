@@ -20,11 +20,11 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v6
         with:
           version: 10.18.0
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
       - run: pnpm install --no-frozen-lockfile
@@ -44,4 +44,5 @@ jobs:
           MINIAPP_PAGES_PROJECT: ${{ vars.MINIAPP_PAGES_PROJECT || 'hendy-mini-app' }}
           ADMIN_PAGES_PROJECT: ${{ vars.ADMIN_PAGES_PROJECT || 'hendy-web-admin' }}
           STOREFRONT_PAGES_PROJECT: ${{ vars.STOREFRONT_PAGES_PROJECT || 'hendy-app-storefront' }}
+          PLATFORM_API_WORKER_NAME: ${{ vars.PLATFORM_API_WORKER_NAME || 'hendy-platform-api' }}
         run: node scripts/sync-deployment-domains.mjs miniapp

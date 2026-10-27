@@ -167,8 +167,10 @@ async function bankWebhook(request, env, rawBody) {
   const result = await env.DB.batch([
     env.DB.prepare(`UPDATE users SET balance_vnd=balance_vnd+(SELECT amount_vnd FROM deposit_requests WHERE reference=? AND status='pending' AND amount_vnd=?), updated_at=?
       WHERE id=(SELECT user_id FROM deposit_requests WHERE reference=? AND status='pending' AND amount_vnd=?)
-      AND EXISTS(SELECT 1 FROM deposit_requests WHERE reference=? AND status='pending' AND amount_vnd=?)`)
-      .bind(reference, amount, now, reference, amount, reference, amount),
+      AND EXISTS(SELECT 1 FROM deposit_requests WHERE reference=? AND status='pending' AND amount_vnd=?)
+      AND NOT EXISTS(SELECT 1 FROM bank_webhook_events WHERE provider_tx_id=?)
+      AND NOT EXISTS(SELECT 1 FROM deposit_requests WHERE provider_tx_id=?)`)
+      .bind(reference, amount, now, reference, amount, reference, amount, transactionId, transactionId),
     env.DB.prepare(`UPDATE deposit_requests SET status='credited',provider_tx_id=?,updated_at=? WHERE reference=? AND status='pending' AND amount_vnd=? AND changes()=1`)
       .bind(transactionId, now, reference, amount),
     env.DB.prepare(`INSERT OR IGNORE INTO bank_webhook_events(provider_tx_id,reference,raw_event_hash,received_at)
@@ -480,7 +482,7 @@ export async function handleBinaryDownload(request, env, url) {
 const CONFIG_RULES = {
   APP_URL: 'optional-url', ADMIN_URL: 'optional-url', STOREFRONT_URL: 'optional-url',
   MINIAPP_PUBLIC_URL: 'optional-url', ADMIN_PUBLIC_URL: 'optional-url', STOREFRONT_PUBLIC_URL: 'optional-url',
-  MINIAPP_DOMAIN_OVERRIDE: 'optional-url', ADMIN_DOMAIN_OVERRIDE: 'optional-url', STOREFRONT_DOMAIN_OVERRIDE: 'optional-url',
+  MINIAPP_DOMAIN_OVERRIDE: 'optional-url', ADMIN_DOMAIN_OVERRIDE: 'optional-url', STOREFRONT_DOMAIN_OVERRIDE: 'optional-url', WORKER_API_DOMAIN_OVERRIDE: 'optional-url',
   VITE_API_BASE_URL: 'optional-url', CORS_ORIGINS: 'origins',
   BOT_USERNAME: 'username',
   MIN_DEPOSIT_VND: 'integer', MAX_DEPOSIT_VND: 'integer',
@@ -494,7 +496,7 @@ const CONFIG_RULES = {
 const CONFIG_DEFAULTS = {
   APP_URL: '', ADMIN_URL: '', STOREFRONT_URL: '',
   MINIAPP_PUBLIC_URL: '', ADMIN_PUBLIC_URL: '', STOREFRONT_PUBLIC_URL: '',
-  MINIAPP_DOMAIN_OVERRIDE: '', ADMIN_DOMAIN_OVERRIDE: '', STOREFRONT_DOMAIN_OVERRIDE: '',
+  MINIAPP_DOMAIN_OVERRIDE: '', ADMIN_DOMAIN_OVERRIDE: '', STOREFRONT_DOMAIN_OVERRIDE: '', WORKER_API_DOMAIN_OVERRIDE: '',
   VITE_API_BASE_URL: '', CORS_ORIGINS: '',
   BOT_USERNAME: '', MIN_DEPOSIT_VND: '10000', MAX_DEPOSIT_VND: '100000000',
   DAILY_CHECKIN_REWARD_VND: '1000', REFERRAL_REWARD_VND: '2000',

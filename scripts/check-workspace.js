@@ -9,7 +9,7 @@ const required = [
   'workers/queue-processor/wrangler.toml', 'workers/edge-router/wrangler.toml',
   'workers/self-healing-bot/wrangler.toml', 'database/migrations/0001_core_schema.sql',
   'database/migrations/0008_feature_flags.sql', '.github/workflows/ci-test.yml',
-  '.github/workflows/deploy-workers.yml', 'scripts/scaffold/generate-module.js',
+  '.github/workflows/deploy-workers.yml',
 ];
 const errors = [];
 for (const file of required) if (!fs.existsSync(path.join(root, file))) errors.push(`Missing required path: ${file}`);
@@ -37,6 +37,28 @@ for (let i = 0; i < migrations.length; i++) {
   const expected = String(i + 1).padStart(4, '0');
   if (!migrations[i].startsWith(`${expected}_`)) errors.push(`Migration numbering gap at ${migrations[i]} (expected ${expected}_...)`);
 }
+// Catch malformed GitHub Actions steps arrays early. A previous deploy regression
+// left "with:" directly under "steps:", so GitHub could not create runnable jobs.
+const workflowsDir = path.join(root, '.github/workflows');
+if (fs.existsSync(workflowsDir)) {
+  for (const entry of fs.readdirSync(workflowsDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !/\\.ya?ml$/i.test(entry.name)) continue;
+    const file = path.join(workflowsDir, entry.name);
+    const lines = fs.readFileSync(file, 'utf8').split(/\\r?\\n/);
+    for (let i = 0; i < lines.length; i++) {
+      const match = lines[i].match(/^(\\s*)steps:\\s*(?:#.*)?$/);
+      if (!match) continue;
+      let next = i + 1;
+      while (next < lines.length && (!lines[next].trim() || lines[next].trim().startsWith('#'))) next++;
+      const indent = match[1].length;
+      const nextIndent = next < lines.length ? (lines[next].match(/^\\s*/) || [''])[0].length : -1;
+      if (next >= lines.length || nextIndent <= indent || !lines[next].trimStart().startsWith('- ')) {
+        errors.push(`Invalid steps list in ${path.relative(root, file)} at line ${i + 1}: expected a list item after "steps:"`);
+      }
+    }
+  }
+}
+
 for (const file of ['.env', '.dev.vars', 'workers/platform-api/.dev.vars']) {
   if (fs.existsSync(path.join(root, file))) errors.push(`Do not commit local secret file: ${file}`);
 }
