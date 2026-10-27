@@ -38,9 +38,8 @@ jobs:
           base64 --decode /tmp/source.tar.xz.b64 > /tmp/source.tar.xz
           mkdir -p /tmp/hendy-source
           tar -xJf /tmp/source.tar.xz -C /tmp/hendy-source
-          rsync -a --exclude='.git/' /tmp/hendy-source/ ./
+          rsync -a --exclude='.git/' --exclude='.github/workflows/***' /tmp/hendy-source/ ./
           rm -rf .bootstrap
-          rm -f .github/workflows/bootstrap-source.yml
       - name: Set up Node
         if: steps.gate.outputs.present == 'true'
         uses: actions/setup-node@v4
