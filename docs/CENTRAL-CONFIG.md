@@ -23,16 +23,17 @@ Create these in **Settings → Secrets and variables → Actions** (repository s
 
 - `CLOUDFLARE_D1_DATABASE_ID` and `CLOUDFLARE_DEDUPE_KV_NAMESPACE_ID`.
 - `MINIAPP_PAGES_PROJECT`, `ADMIN_PAGES_PROJECT`, `STOREFRONT_PAGES_PROJECT` if the default project names differ.
-- Optional URL override variables: `MINIAPP_DOMAIN_OVERRIDE`, `ADMIN_DOMAIN_OVERRIDE`, `STOREFRONT_DOMAIN_OVERRIDE`. A custom domain must already be attached to its Cloudflare Pages project and have DNS/TLS configured.
+- Optional URL override variables: `MINIAPP_DOMAIN_OVERRIDE`, `ADMIN_DOMAIN_OVERRIDE`, `STOREFRONT_DOMAIN_OVERRIDE`, and `WORKER_API_DOMAIN_OVERRIDE`. Page custom domains must be attached to the respective Pages project; Worker API custom domains must be attached to the `hendy-platform-api` Worker. Configure DNS/TLS before using an override. If no Worker override is set, the sync script detects an enabled Worker custom domain or falls back to its enabled `workers.dev` route.
 - For a Worker secret that will be updated from the UI, ensure `HENDY_GITHUB_TOKEN` has the permission needed to manage the corresponding repository secret.
 
 ## Domain update flow
 
 1. Deploy the Mini App or one/both web frontends.
 2. The matching workflow calls the domain-sync script only after the Pages deploy steps succeed.
-3. The script reads the actual Pages project domains from the Cloudflare API and updates `APP_URL`, `ADMIN_URL`, `STOREFRONT_URL`, their public-URL aliases, and `CORS_ORIGINS`.
+3. The script reads the actual Pages project domains and the platform API Worker domain from the Cloudflare API. It updates `APP_URL`, `ADMIN_URL`, `STOREFRONT_URL`, their public-URL aliases, `CORS_ORIGINS`, and `VITE_API_BASE_URL`.
 4. The script dispatches `deploy-workers.yml` by default so the updated origins are picked up by the API's CORS configuration and Worker environment.
-5. Check GitHub Actions logs for the domain-sync step and the follow-up Workers run. A workflow dispatch is not itself proof that deployment succeeded.
+5. A changed API endpoint dispatches Web and Mini App builds so the new `VITE_API_BASE_URL` is compiled into the bundles. Changed app URLs/CORS dispatch the Workers deployment. The script compares variables first, so follow-up runs with unchanged URLs do not keep dispatching themselves.
+6. Check GitHub Actions logs for the domain-sync step and follow-up Workers/Pages runs. A workflow dispatch is not itself proof that deployment succeeded.
 
 ## Operational notes
 

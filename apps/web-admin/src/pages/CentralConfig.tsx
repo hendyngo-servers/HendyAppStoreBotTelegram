@@ -6,7 +6,7 @@ type ConfigValues = Record<string, string>;
 type Field = { key: string; label: string; help?: string; type?: 'text' | 'number' | 'textarea' | 'boolean'; placeholder?: string };
 
 const EDITABLE_KEYS = [
-  'MINIAPP_DOMAIN_OVERRIDE','ADMIN_DOMAIN_OVERRIDE','STOREFRONT_DOMAIN_OVERRIDE','VITE_API_BASE_URL',
+  'MINIAPP_DOMAIN_OVERRIDE','ADMIN_DOMAIN_OVERRIDE','STOREFRONT_DOMAIN_OVERRIDE','WORKER_API_DOMAIN_OVERRIDE',
   'BOT_USERNAME','MIN_DEPOSIT_VND','MAX_DEPOSIT_VND','DAILY_CHECKIN_REWARD_VND','REFERRAL_REWARD_VND',
   'SESSION_TTL_SECONDS','MAX_INIT_DATA_AGE_SECONDS','BANK_ID','BANK_ACCOUNT_NUMBER','BANK_ACCOUNT_NAME','BANK_SYNC_URL',
   'TASKS_CONFIG_JSON','MINIGAME_CONFIG_JSON','MAINTENANCE_MESSAGE','TASKS_ENABLED','MINIGAME_ENABLED',
@@ -16,12 +16,12 @@ const EDITABLE_KEYS = [
 const FIELDS: { title: string; description: string; fields: Field[] }[] = [
   {
     title: 'Tên miền và API',
-    description: 'Tên miền tùy chỉnh phải được cấu hình DNS và gắn vào Cloudflare Pages trước. Để trống trường override để tự phát hiện domain từ dự án Pages sau khi deploy.',
+    description: 'Tên miền tùy chỉnh phải được cấu hình DNS và gắn với dịch vụ Cloudflare tương ứng trước. Để trống override để tự phát hiện domain Pages hoặc URL Worker sau khi deploy.',
     fields: [
       { key: 'MINIAPP_DOMAIN_OVERRIDE', label: 'Domain Mini App', placeholder: 'https://app.example.com' },
       { key: 'ADMIN_DOMAIN_OVERRIDE', label: 'Domain Admin', placeholder: 'https://admin.example.com' },
       { key: 'STOREFRONT_DOMAIN_OVERRIDE', label: 'Domain Storefront', placeholder: 'https://store.example.com' },
-      { key: 'VITE_API_BASE_URL', label: 'API base URL', placeholder: 'https://api.example.com', help: 'Dùng để build các frontend; giá trị mới có hiệu lực sau khi build/deploy lại.' },
+      { key: 'WORKER_API_DOMAIN_OVERRIDE', label: 'Domain API Worker (override tùy chọn)', placeholder: 'https://api.example.com', help: 'Để trống để tự phát hiện custom domain của hendy-platform-api hoặc URL workers.dev. Thay đổi API URL sẽ tự yêu cầu build lại Mini App và Web.' },
     ],
   },
   {
@@ -180,11 +180,12 @@ export default function CentralConfig({ token }: { token: string }) {
         <div className="config-status"><span>GitHub Variables</span><b className={githubVariablesAvailable ? 'config-good' : 'config-warn'}>{githubVariablesAvailable ? 'Đã kết nối' : 'Chưa kết nối'}</b></div>
         <div className="config-status"><span>GitHub Secrets</span><b className={githubSecretsAvailable ? 'config-good' : 'config-warn'}>{githubSecretsAvailable ? 'Đã kết nối' : 'Chưa kiểm tra được'}</b></div>
         <div className="config-status"><span>Domain Mini App</span><a href={values.APP_URL || undefined} target="_blank" rel="noreferrer">{values.APP_URL || 'Chưa được phát hiện'}</a></div>
+        <div className="config-status"><span>API Worker endpoint (tự phát hiện)</span><a href={values.VITE_API_BASE_URL || undefined} target="_blank" rel="noreferrer">{values.VITE_API_BASE_URL || 'Chưa được phát hiện'}</a></div>
         <div className="config-status"><span>Domain Admin</span><a href={values.ADMIN_URL || undefined} target="_blank" rel="noreferrer">{values.ADMIN_URL || 'Chưa được phát hiện'}</a></div>
         <div className="config-status"><span>Domain Storefront</span><a href={values.STOREFRONT_URL || undefined} target="_blank" rel="noreferrer">{values.STOREFRONT_URL || 'Chưa được phát hiện'}</a></div>
         <div className="config-status"><span>CORS origins</span><small>{values.CORS_ORIGINS || 'Được đồng bộ sau lần deploy Pages đầu tiên'}</small></div>
       </div>
-      <p className="config-note">Domain công khai được đọc từ Cloudflare Pages sau khi deploy thành công. Trường domain override cho phép chọn custom domain đã gắn trong Cloudflare; nếu để trống, hệ thống dùng domain Pages phát hiện được.</p>
+      <p className="config-note">Domain Pages được đọc từ Cloudflare sau deploy; API Worker được phát hiện từ custom Worker domain hoặc workers.dev khi bật. Override cho phép chỉ định HTTPS origin đã cấu hình trong Cloudflare; nếu để trống, hệ thống tự phát hiện.</p>
     </section>
 
     {error && <div className="alert bad" role="alert">{error}</div>}

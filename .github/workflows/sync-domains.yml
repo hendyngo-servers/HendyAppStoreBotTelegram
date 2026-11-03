@@ -5,7 +5,7 @@ on:
       target:
         description: Pages deployment scope to inspect
         type: choice
-        options: [all, miniapp, web]
+        options: [all, miniapp, web, workers]
         default: all
         required: true
 permissions:
@@ -41,4 +41,5 @@ jobs:
           MINIAPP_PAGES_PROJECT: ${{ vars.MINIAPP_PAGES_PROJECT || 'hendy-mini-app' }}
           ADMIN_PAGES_PROJECT: ${{ vars.ADMIN_PAGES_PROJECT || 'hendy-web-admin' }}
           STOREFRONT_PAGES_PROJECT: ${{ vars.STOREFRONT_PAGES_PROJECT || 'hendy-app-storefront' }}
+          PLATFORM_API_WORKER_NAME: ${{ vars.PLATFORM_API_WORKER_NAME || 'hendy-platform-api' }}
         run: node scripts/sync-deployment-domains.mjs "${{ inputs.target }}"

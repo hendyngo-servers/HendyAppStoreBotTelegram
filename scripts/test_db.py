@@ -64,7 +64,9 @@ def credit_deposit():
     sqls = [
         ("""UPDATE users SET balance_vnd=balance_vnd+(SELECT amount_vnd FROM deposit_requests WHERE reference=? AND status='pending' AND amount_vnd=?),updated_at=?
           WHERE id=(SELECT user_id FROM deposit_requests WHERE reference=? AND status='pending' AND amount_vnd=?)
-          AND EXISTS(SELECT 1 FROM deposit_requests WHERE reference=? AND status='pending' AND amount_vnd=?)""", ("HENDY-TEST", 50_000, now, "HENDY-TEST", 50_000, "HENDY-TEST", 50_000)),
+          AND EXISTS(SELECT 1 FROM deposit_requests WHERE reference=? AND status='pending' AND amount_vnd=?)
+          AND NOT EXISTS(SELECT 1 FROM bank_webhook_events WHERE provider_tx_id=?)
+          AND NOT EXISTS(SELECT 1 FROM deposit_requests WHERE provider_tx_id=?)""", ("HENDY-TEST", 50_000, now, "HENDY-TEST", 50_000, "HENDY-TEST", 50_000, "bank-tx-1", "bank-tx-1")),
         ("UPDATE deposit_requests SET status='credited',provider_tx_id=?,updated_at=? WHERE reference=? AND status='pending' AND amount_vnd=? AND changes()=1", ("bank-tx-1", now, "HENDY-TEST", 50_000)),
         ("""INSERT OR IGNORE INTO bank_webhook_events(provider_tx_id,reference,raw_event_hash,received_at)
           SELECT ?,?,?,? WHERE EXISTS(SELECT 1 FROM deposit_requests WHERE reference=? AND status='credited' AND provider_tx_id=?)""", ("bank-tx-1", "HENDY-TEST", "digest", now, "HENDY-TEST", "bank-tx-1")),
@@ -78,6 +80,31 @@ def credit_deposit():
 credit_deposit()
 credit_deposit()
 assert conn.execute("SELECT balance_vnd FROM users WHERE id=?", (user_id,)).fetchone()[0] == 120_000
+assert conn.execute("SELECT COUNT(*) FROM wallet_transactions WHERE kind='deposit'").fetchone()[0] == 1
+
+# A provider transaction ID may credit only one deposit reference, even when
+# a replay is signed correctly but points at a different pending deposit.
+conn.execute("INSERT INTO deposit_requests(id,user_id,reference,amount_vnd,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", ("deposit-2", user_id, "HENDY-TEST-2", 10_000, "pending", now, now))
+def credit_duplicate_provider_transaction():
+    sqls = [
+        ("""UPDATE users SET balance_vnd=balance_vnd+(SELECT amount_vnd FROM deposit_requests WHERE reference=? AND status='pending' AND amount_vnd=?),updated_at=?
+          WHERE id=(SELECT user_id FROM deposit_requests WHERE reference=? AND status='pending' AND amount_vnd=?)
+          AND EXISTS(SELECT 1 FROM deposit_requests WHERE reference=? AND status='pending' AND amount_vnd=?)
+          AND NOT EXISTS(SELECT 1 FROM bank_webhook_events WHERE provider_tx_id=?)
+          AND NOT EXISTS(SELECT 1 FROM deposit_requests WHERE provider_tx_id=?)""", ("HENDY-TEST-2", 10_000, now, "HENDY-TEST-2", 10_000, "HENDY-TEST-2", 10_000, "bank-tx-1", "bank-tx-1")),
+        ("UPDATE deposit_requests SET status='credited',provider_tx_id=?,updated_at=? WHERE reference=? AND status='pending' AND amount_vnd=? AND changes()=1", ("bank-tx-1", now, "HENDY-TEST-2", 10_000)),
+        ("""INSERT OR IGNORE INTO bank_webhook_events(provider_tx_id,reference,raw_event_hash,received_at)
+          SELECT ?,?,?,? WHERE EXISTS(SELECT 1 FROM deposit_requests WHERE reference=? AND status='credited' AND provider_tx_id=?)""", ("bank-tx-1", "HENDY-TEST-2", "different-digest", now, "HENDY-TEST-2", "bank-tx-1")),
+        ("""INSERT OR IGNORE INTO wallet_transactions(user_id,kind,amount_vnd,reference,note,created_at)
+          SELECT user_id,'deposit',amount_vnd,provider_tx_id,'Bank deposit',? FROM deposit_requests WHERE reference=? AND status='credited' AND provider_tx_id=?""", (now, "HENDY-TEST-2", "bank-tx-1")),
+    ]
+    conn.execute("BEGIN")
+    for sql, values in sqls:
+        conn.execute(sql, values)
+    conn.execute("COMMIT")
+credit_duplicate_provider_transaction()
+assert conn.execute("SELECT balance_vnd FROM users WHERE id=?", (user_id,)).fetchone()[0] == 120_000
+assert conn.execute("SELECT status FROM deposit_requests WHERE id='deposit-2'").fetchone()[0] == "pending"
 assert conn.execute("SELECT COUNT(*) FROM wallet_transactions WHERE kind='deposit'").fetchone()[0] == 1
 
 # Giftcode duplicate callbacks/requests cannot double-credit.
